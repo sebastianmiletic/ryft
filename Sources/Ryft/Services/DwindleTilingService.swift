@@ -52,6 +52,9 @@ final class DwindleTilingService: ObservableObject {
     private var configuration = TilingConfiguration()
     private var originalWindows: [CGWindowID: OriginalWindow] = [:]
     private var zoomSuspendedWindowIDs = Set<CGWindowID>()
+    private var pendingNativeZoomWindowID: CGWindowID?
+    private var pendingNativeZoomAt: CFTimeInterval = 0
+    private var doubleClickMonitor: Any?
     private var windowOrder: [CGWindowID: Int] = [:]
     private var nextOrder = 0
     private var appliedLayoutSignature: [String] = []
@@ -65,6 +68,17 @@ final class DwindleTilingService: ObservableObject {
     private var pointerInteractionActive = false
     private var pointerBaseline: [CGWindowID: CGRect] = [:]
 
+    init() {
+        doubleClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard event.clickCount >= 2, let point = event.cgEvent?.location else { return }
+            self?.recordNativeTitleBarDoubleClick(at: point)
+        }
+    }
+
+    deinit {
+        if let doubleClickMonitor { NSEvent.removeMonitor(doubleClickMonitor) }
+    }
+
     func setEnabled(_ value: Bool) {
         enabled = value
         if value {
@@ -76,7 +90,7 @@ final class DwindleTilingService: ObservableObject {
         } else {
             restoreManagedWindows(animated: true)
             timer?.invalidate(); timer = nil
-            expectedFrames.removeAll(); splitRatios.removeAll(); pointerWasDown = false; pointerInteractionActive = false; pointerBaseline.removeAll()
+            expectedFrames.removeAll(); splitRatios.removeAll(); zoomSuspendedWindowIDs.removeAll(); pendingNativeZoomWindowID = nil; pointerWasDown = false; pointerInteractionActive = false; pointerBaseline.removeAll()
             running = false
             managedApplicationCount = 0
             status = "Automatic tiling is off"
@@ -120,7 +134,7 @@ final class DwindleTilingService: ObservableObject {
         timer?.invalidate(); timer = nil
         animationTimer?.invalidate(); animationTimer = nil
         animations.removeAll()
-        expectedFrames.removeAll(); splitRatios.removeAll(); pointerWasDown = false; pointerInteractionActive = false; pointerBaseline.removeAll()
+        expectedFrames.removeAll(); splitRatios.removeAll(); zoomSuspendedWindowIDs.removeAll(); pendingNativeZoomWindowID = nil; pointerWasDown = false; pointerInteractionActive = false; pointerBaseline.removeAll()
         enabled = false
     }
 
@@ -237,6 +251,8 @@ final class DwindleTilingService: ObservableObject {
     }
 
     private func updateZoomSuspensions(_ windows: [ManagedWindow]) {
+        let now = CACurrentMediaTime()
+        if now - pendingNativeZoomAt > 1.4 { pendingNativeZoomWindowID = nil }
         for window in windows {
             let available = availableFrame(for: window.screen)
             let coversDisplay = window.frame.width >= available.width * 0.88
@@ -244,16 +260,36 @@ final class DwindleTilingService: ObservableObject {
                 && abs(window.frame.midX - available.midX) <= 36
                 && abs(window.frame.midY - available.midY) <= 36
             if zoomSuspendedWindowIDs.contains(window.id) {
-                // A second title-bar double-click restores the native frame.
-                // Once that happens Ryft resumes management on the next pass.
+                // macOS owns the maximized frame. A second native title-bar
+                // double-click restores it; only then does tiling resume.
                 if !coversDisplay { zoomSuspendedWindowIDs.remove(window.id) }
-            } else if let expected = expectedFrames[window.id], coversDisplay,
-                      frameDifference(window.frame, expected) > 40,
-                      NSEvent.pressedMouseButtons & 1 == 0 {
+            } else if pendingNativeZoomWindowID == window.id,
+                      let expected = expectedFrames[window.id], coversDisplay,
+                      frameDifference(window.frame, expected) > 40 {
                 animationTimer?.invalidate(); animationTimer = nil
                 animations.removeValue(forKey: window.id)
                 zoomSuspendedWindowIDs.insert(window.id)
+                pendingNativeZoomWindowID = nil
             }
+        }
+    }
+
+    private func recordNativeTitleBarDoubleClick(at point: CGPoint) {
+        guard enabled,
+              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[CFString: Any]] else { return }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        for info in list {
+            guard let pid = (info[kCGWindowOwnerPID] as? NSNumber)?.int32Value,
+                  pid != ownPID,
+                  (info[kCGWindowLayer] as? NSNumber)?.intValue == 0,
+                  let bounds = info[kCGWindowBounds] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds),
+                  frame.contains(point),
+                  point.y <= frame.minY + min(54, max(30, frame.height * 0.10)),
+                  let number = info[kCGWindowNumber] as? NSNumber else { continue }
+            pendingNativeZoomWindowID = CGWindowID(number.uint32Value)
+            pendingNativeZoomAt = CACurrentMediaTime()
+            return
         }
     }
 
