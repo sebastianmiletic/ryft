@@ -47,6 +47,7 @@ final class SystemControlService: NSObject, ObservableObject, CLLocationManagerD
         return manager
     }()
     private var levelTimer: Timer?
+    private var wifiConnectionAttempt = UUID()
     private var powerTimer: Timer?
     private var powerSource: CFRunLoopSource?
     private var observers: [NSObjectProtocol] = []
@@ -134,9 +135,17 @@ final class SystemControlService: NSObject, ObservableObject, CLLocationManagerD
     }
 
     func setWiFiEnabled(_ enabled: Bool) {
-        guard let interface = CWWiFiClient.shared().interface() else { return }
-        do { try interface.setPower(enabled); refreshWiFiState(); if enabled { scanWiFi() } }
-        catch { operationMessage = "Wi-Fi: \(error.localizedDescription)" }
+        guard let interface = CWWiFiClient.shared().interface() else { operationMessage = "Wi-Fi interface is unavailable."; return }
+        do {
+            try interface.setPower(enabled)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.refreshWiFiState(); if enabled { self.scanWiFi() } }
+        } catch {
+            runNetworkSetup(["-setairportpower", interface.interfaceName ?? "en0", enabled ? "on" : "off"]) { success, message in
+                self.refreshWiFiState()
+                self.operationMessage = success ? (enabled ? "Wi-Fi enabled" : "Wi-Fi disabled") : "Wi-Fi: \(message)"
+                if success && enabled { self.scanWiFi() }
+            }
+        }
     }
 
     func scanWiFi() { scanWiFi(attempt: 0) }
@@ -183,35 +192,78 @@ final class SystemControlService: NSObject, ObservableObject, CLLocationManagerD
     }
 
     func connect(to info: WiFiNetworkInfo, password: String = "") {
-        guard let interface = CWWiFiClient.shared().interface() else { return }
+        guard let interface = CWWiFiClient.shared().interface() else { operationMessage = "Wi-Fi interface is unavailable."; return }
+        let suppliedPassword = info.secure && !info.known ? password : ""
+        let attempt = UUID(); wifiConnectionAttempt = attempt
         operationMessage = "Connecting to \(info.ssid)…"
         DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try interface.associate(to: info.network, password: (info.secure && !info.known) ? password : nil)
-                DispatchQueue.main.async { self.operationMessage = "Connected to \(info.ssid)"; self.refreshWiFiState() }
-            } catch { DispatchQueue.main.async {
-                let message = error.localizedDescription
-                self.operationMessage = message.localizedCaseInsensitiveContains("cancel") ? "" : "Could not connect: \(message)"
-            } }
+            do { try interface.associate(to: info.network, password: suppliedPassword.isEmpty ? nil : suppliedPassword) }
+            catch { /* networksetup below can use the saved system profile */ }
+            DispatchQueue.main.async { self.verifyWiFiConnection(ssid: info.ssid, password: suppliedPassword, attempt: attempt, poll: 0) }
         }
     }
 
     func connectHiddenNetwork(ssid: String, password: String) {
         let ssid = ssid.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !ssid.isEmpty, let interface = CWWiFiClient.shared().interface() else { operationMessage = "Enter a network name."; return }
+        let attempt = UUID(); wifiConnectionAttempt = attempt
         operationMessage = "Finding \(ssid)…"
         DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                guard let network = try interface.scanForNetworks(withName: ssid).max(by: { $0.rssiValue < $1.rssiValue }) else {
-                    DispatchQueue.main.async { self.operationMessage = "Network not found." }; return
-                }
-                try interface.associate(to: network, password: password.isEmpty ? nil : password)
-                DispatchQueue.main.async { self.operationMessage = "Connected to \(ssid)"; self.refreshWiFiState(); self.scanWiFi() }
-            } catch { DispatchQueue.main.async { self.operationMessage = "Could not join: \(error.localizedDescription)" } }
+            if let network = try? interface.scanForNetworks(withName: ssid).max(by: { $0.rssiValue < $1.rssiValue }) {
+                try? interface.associate(to: network, password: password.isEmpty ? nil : password)
+            }
+            DispatchQueue.main.async { self.verifyWiFiConnection(ssid: ssid, password: password, attempt: attempt, poll: 0) }
         }
     }
 
-    func disconnectWiFi() { CWWiFiClient.shared().interface()?.disassociate(); refreshWiFiState(); operationMessage = "Disconnected" }
+    func disconnectWiFi() {
+        wifiConnectionAttempt = UUID()
+        CWWiFiClient.shared().interface()?.disassociate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { self.refreshWiFiState(); self.operationMessage = "Disconnected" }
+    }
+
+    private func verifyWiFiConnection(ssid: String, password: String, attempt: UUID, poll: Int) {
+        guard wifiConnectionAttempt == attempt else { return }
+        refreshWiFiState()
+        if connectedSSID == ssid {
+            operationMessage = "Connected to \(ssid)"
+            scanWiFi()
+            return
+        }
+        if poll < 6 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { self.verifyWiFiConnection(ssid: ssid, password: password, attempt: attempt, poll: poll + 1) }
+            return
+        }
+        guard let interface = CWWiFiClient.shared().interface() else { operationMessage = "Wi-Fi interface is unavailable."; return }
+        var arguments = ["-setairportnetwork", interface.interfaceName ?? "en0", ssid]
+        if !password.isEmpty { arguments.append(password) }
+        runNetworkSetup(arguments) { success, message in
+            guard self.wifiConnectionAttempt == attempt else { return }
+            if success {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    self.refreshWiFiState()
+                    self.operationMessage = self.connectedSSID == ssid ? "Connected to \(ssid)" : "Could not switch to \(ssid)."
+                    if self.connectedSSID == ssid { self.scanWiFi() }
+                }
+            } else {
+                self.operationMessage = "Could not connect: \(message)"
+            }
+        }
+    }
+
+    private func runNetworkSetup(_ arguments: [String], completion: @escaping (Bool, String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process(); let errorPipe = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice; process.standardError = errorPipe
+            do {
+                try process.run(); process.waitUntilExit()
+                let message = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown error"
+                DispatchQueue.main.async { completion(process.terminationStatus == 0, message) }
+            } catch { DispatchQueue.main.async { completion(false, error.localizedDescription) } }
+        }
+    }
 
     func refreshAudioDevices() {
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)

@@ -51,6 +51,7 @@ final class DwindleTilingService: ObservableObject {
     private var bar = BarConfiguration()
     private var configuration = TilingConfiguration()
     private var originalWindows: [CGWindowID: OriginalWindow] = [:]
+    private var zoomSuspendedWindowIDs = Set<CGWindowID>()
     private var windowOrder: [CGWindowID: Int] = [:]
     private var nextOrder = 0
     private var appliedLayoutSignature: [String] = []
@@ -160,12 +161,15 @@ final class DwindleTilingService: ObservableObject {
         pendingLayoutSignature = []
         pendingLayoutObservations = 0
 
-        let grouped = Dictionary(grouping: windows, by: { displayID(for: $0.screen) })
+        let interactionGroups = Dictionary(grouping: windows, by: { displayID(for: $0.screen) })
 
         // While the pointer is down, let the native window edge or title bar
         // track the pointer without Ryft fighting AppKit. On release, translate
         // the gesture into either a divider ratio or a slot swap.
         let pointerDown = NSEvent.pressedMouseButtons & 1 != 0
+        let suspendedBeforeGestureEnd = zoomSuspendedWindowIDs
+        if !pointerDown { updateZoomSuspensions(windows) }
+        let newlyZoomed = !zoomSuspendedWindowIDs.subtracting(suspendedBeforeGestureEnd).isEmpty
         if pointerDown {
             if !pointerWasDown {
                 pointerWasDown = true
@@ -185,9 +189,12 @@ final class DwindleTilingService: ObservableObject {
             pointerBaseline.removeAll()
             if pointerInteractionActive {
                 pointerInteractionActive = false
-                absorbPointerInteraction(windows: windows, grouped: grouped)
+                if !newlyZoomed { absorbPointerInteraction(windows: windows, grouped: interactionGroups) }
             }
         }
+
+        let tileableWindows = windows.filter { !zoomSuspendedWindowIDs.contains($0.id) }
+        let grouped = Dictionary(grouping: tileableWindows, by: { displayID(for: $0.screen) })
 
         var tiledIDs = Set<CGWindowID>()
         var tiledApplicationCount = 0
@@ -211,17 +218,42 @@ final class DwindleTilingService: ObservableObject {
 
         // A window that was tiled and is now the only application on its
         // visible display returns to the frame it had before Ryft touched it.
-        for window in windows where originalWindows[window.id] != nil && !tiledIDs.contains(window.id) { restore([window]) }
+        for window in windows where originalWindows[window.id] != nil && !tiledIDs.contains(window.id) && !zoomSuspendedWindowIDs.contains(window.id) { restore([window]) }
         let existingIDs = allWindowIDs()
         originalWindows = originalWindows.filter { existingIDs.contains($0.key) }
         windowOrder = windowOrder.filter { existingIDs.contains($0.key) }
+        zoomSuspendedWindowIDs.formIntersection(existingIDs)
         expectedFrames = nextExpectedFrames
 
         managedApplicationCount = tiledApplicationCount
-        switch tiledApplicationCount {
-        case 0: status = "Waiting for an application"
-        case 1: status = "Filling the display with 1 window"
-        default: status = "Tiling \(tiledApplicationCount) windows"
+        let suspended = zoomSuspendedWindowIDs.count
+        switch (tiledApplicationCount, suspended) {
+        case (0, 0): status = "Waiting for an application"
+        case (0, let count): status = "Leaving \(count) window\(count == 1 ? "" : "s") maximized"
+        case (1, 0): status = "Filling the display with 1 window"
+        case (let count, 0): status = "Tiling \(count) windows"
+        case (let count, let maximized): status = "Tiling \(count) · \(maximized) maximized"
+        }
+    }
+
+    private func updateZoomSuspensions(_ windows: [ManagedWindow]) {
+        for window in windows {
+            let available = availableFrame(for: window.screen)
+            let coversDisplay = window.frame.width >= available.width * 0.88
+                && window.frame.height >= available.height * 0.88
+                && abs(window.frame.midX - available.midX) <= 36
+                && abs(window.frame.midY - available.midY) <= 36
+            if zoomSuspendedWindowIDs.contains(window.id) {
+                // A second title-bar double-click restores the native frame.
+                // Once that happens Ryft resumes management on the next pass.
+                if !coversDisplay { zoomSuspendedWindowIDs.remove(window.id) }
+            } else if let expected = expectedFrames[window.id], coversDisplay,
+                      frameDifference(window.frame, expected) > 40,
+                      NSEvent.pressedMouseButtons & 1 == 0 {
+                animationTimer?.invalidate(); animationTimer = nil
+                animations.removeValue(forKey: window.id)
+                zoomSuspendedWindowIDs.insert(window.id)
+            }
         }
     }
 
