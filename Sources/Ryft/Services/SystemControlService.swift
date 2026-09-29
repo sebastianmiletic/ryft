@@ -196,10 +196,20 @@ final class SystemControlService: NSObject, ObservableObject, CLLocationManagerD
         let suppliedPassword = info.secure && !info.known ? password : ""
         let attempt = UUID(); wifiConnectionAttempt = attempt
         operationMessage = "Connecting to \(info.ssid)…"
-        DispatchQueue.global(qos: .userInitiated).async {
-            do { try interface.associate(to: info.network, password: suppliedPassword.isEmpty ? nil : suppliedPassword) }
-            catch { /* networksetup below can use the saved system profile */ }
-            DispatchQueue.main.async { self.verifyWiFiConnection(ssid: info.ssid, password: suppliedPassword, attempt: attempt, poll: 0) }
+        var arguments = ["-setairportnetwork", interface.interfaceName ?? "en0", info.ssid]
+        if !suppliedPassword.isEmpty { arguments.append(suppliedPassword) }
+        // networksetup is the most reliable path for changing to a saved macOS
+        // network because it reuses the SystemConfiguration/Keychain profile.
+        runNetworkSetup(arguments) { [weak self] success, _ in
+            guard let self, self.wifiConnectionAttempt == attempt else { return }
+            if success {
+                self.verifyWiFiConnection(ssid: info.ssid, password: suppliedPassword, attempt: attempt, poll: 0)
+            } else {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    try? interface.associate(to: info.network, password: suppliedPassword.isEmpty ? nil : suppliedPassword)
+                    DispatchQueue.main.async { self.verifyWiFiConnection(ssid: info.ssid, password: suppliedPassword, attempt: attempt, poll: 0) }
+                }
+            }
         }
     }
 
@@ -207,12 +217,21 @@ final class SystemControlService: NSObject, ObservableObject, CLLocationManagerD
         let ssid = ssid.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !ssid.isEmpty, let interface = CWWiFiClient.shared().interface() else { operationMessage = "Enter a network name."; return }
         let attempt = UUID(); wifiConnectionAttempt = attempt
-        operationMessage = "Finding \(ssid)…"
-        DispatchQueue.global(qos: .userInitiated).async {
-            if let network = try? interface.scanForNetworks(withName: ssid).max(by: { $0.rssiValue < $1.rssiValue }) {
-                try? interface.associate(to: network, password: password.isEmpty ? nil : password)
+        operationMessage = "Connecting to \(ssid)…"
+        var arguments = ["-setairportnetwork", interface.interfaceName ?? "en0", ssid]
+        if !password.isEmpty { arguments.append(password) }
+        runNetworkSetup(arguments) { [weak self] success, _ in
+            guard let self, self.wifiConnectionAttempt == attempt else { return }
+            if success {
+                self.verifyWiFiConnection(ssid: ssid, password: password, attempt: attempt, poll: 0)
+            } else {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    if let network = try? interface.scanForNetworks(withName: ssid).max(by: { $0.rssiValue < $1.rssiValue }) {
+                        try? interface.associate(to: network, password: password.isEmpty ? nil : password)
+                    }
+                    DispatchQueue.main.async { self.verifyWiFiConnection(ssid: ssid, password: password, attempt: attempt, poll: 0) }
+                }
             }
-            DispatchQueue.main.async { self.verifyWiFiConnection(ssid: ssid, password: password, attempt: attempt, poll: 0) }
         }
     }
 
@@ -253,13 +272,13 @@ final class SystemControlService: NSObject, ObservableObject, CLLocationManagerD
 
     private func runNetworkSetup(_ arguments: [String], completion: @escaping (Bool, String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let process = Process(); let errorPipe = Pipe()
+            let process = Process(); let outputPipe = Pipe()
             process.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
             process.arguments = arguments
-            process.standardOutput = FileHandle.nullDevice; process.standardError = errorPipe
+            process.standardOutput = outputPipe; process.standardError = outputPipe
             do {
                 try process.run(); process.waitUntilExit()
-                let message = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown error"
+                let message = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown error"
                 DispatchQueue.main.async { completion(process.terminationStatus == 0, message) }
             } catch { DispatchQueue.main.async { completion(false, error.localizedDescription) } }
         }

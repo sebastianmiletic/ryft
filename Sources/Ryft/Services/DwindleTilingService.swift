@@ -52,6 +52,7 @@ final class DwindleTilingService: ObservableObject {
     private var configuration = TilingConfiguration()
     private var originalWindows: [CGWindowID: OriginalWindow] = [:]
     private var zoomSuspendedWindowIDs = Set<CGWindowID>()
+    private var zoomSuspendedAt: [CGWindowID: CFTimeInterval] = [:]
     private var pendingNativeZoomWindowID: CGWindowID?
     private var pendingNativeZoomAt: CFTimeInterval = 0
     private var doubleClickMonitor: Any?
@@ -90,7 +91,7 @@ final class DwindleTilingService: ObservableObject {
         } else {
             restoreManagedWindows(animated: true)
             timer?.invalidate(); timer = nil
-            expectedFrames.removeAll(); splitRatios.removeAll(); zoomSuspendedWindowIDs.removeAll(); pendingNativeZoomWindowID = nil; pointerWasDown = false; pointerInteractionActive = false; pointerBaseline.removeAll()
+            expectedFrames.removeAll(); splitRatios.removeAll(); zoomSuspendedWindowIDs.removeAll(); zoomSuspendedAt.removeAll(); pendingNativeZoomWindowID = nil; pointerWasDown = false; pointerInteractionActive = false; pointerBaseline.removeAll()
             running = false
             managedApplicationCount = 0
             status = "Automatic tiling is off"
@@ -134,7 +135,7 @@ final class DwindleTilingService: ObservableObject {
         timer?.invalidate(); timer = nil
         animationTimer?.invalidate(); animationTimer = nil
         animations.removeAll()
-        expectedFrames.removeAll(); splitRatios.removeAll(); zoomSuspendedWindowIDs.removeAll(); pendingNativeZoomWindowID = nil; pointerWasDown = false; pointerInteractionActive = false; pointerBaseline.removeAll()
+        expectedFrames.removeAll(); splitRatios.removeAll(); zoomSuspendedWindowIDs.removeAll(); zoomSuspendedAt.removeAll(); pendingNativeZoomWindowID = nil; pointerWasDown = false; pointerInteractionActive = false; pointerBaseline.removeAll()
         enabled = false
     }
 
@@ -207,8 +208,15 @@ final class DwindleTilingService: ObservableObject {
             }
         }
 
-        let tileableWindows = windows.filter { !zoomSuspendedWindowIDs.contains($0.id) }
-        let grouped = Dictionary(grouping: tileableWindows, by: { displayID(for: $0.screen) })
+        if !zoomSuspendedWindowIDs.isEmpty {
+            // Maximizing is a temporary native mode, not a layout membership
+            // change. Freeze every other tile in place until the user restores
+            // the maximized window, preventing panes from jumping underneath it.
+            managedApplicationCount = windows.count
+            status = "Tiling paused for maximized window"
+            return
+        }
+        let grouped = Dictionary(grouping: windows, by: { displayID(for: $0.screen) })
 
         var tiledIDs = Set<CGWindowID>()
         var tiledApplicationCount = 0
@@ -262,13 +270,17 @@ final class DwindleTilingService: ObservableObject {
             if zoomSuspendedWindowIDs.contains(window.id) {
                 // macOS owns the maximized frame. A second native title-bar
                 // double-click restores it; only then does tiling resume.
-                if !coversDisplay { zoomSuspendedWindowIDs.remove(window.id) }
+                if !coversDisplay, now - (zoomSuspendedAt[window.id] ?? 0) > 0.75 {
+                    zoomSuspendedWindowIDs.remove(window.id)
+                    zoomSuspendedAt.removeValue(forKey: window.id)
+                }
             } else if pendingNativeZoomWindowID == window.id,
                       let expected = expectedFrames[window.id], coversDisplay,
                       frameDifference(window.frame, expected) > 40 {
                 animationTimer?.invalidate(); animationTimer = nil
                 animations.removeValue(forKey: window.id)
                 zoomSuspendedWindowIDs.insert(window.id)
+                zoomSuspendedAt[window.id] = now
                 pendingNativeZoomWindowID = nil
             }
         }
@@ -285,12 +297,50 @@ final class DwindleTilingService: ObservableObject {
                   let bounds = info[kCGWindowBounds] as? NSDictionary,
                   let frame = CGRect(dictionaryRepresentation: bounds),
                   frame.contains(point),
-                  point.y <= frame.minY + min(54, max(30, frame.height * 0.10)),
                   let number = info[kCGWindowNumber] as? NSNumber else { continue }
-            pendingNativeZoomWindowID = CGWindowID(number.uint32Value)
+            let titleHeight = min(58, max(30, frame.height * 0.10))
+            // CGWindow and CGEvent both use Quartz's top-left display space.
+            // Restrict this to title/tab chrome so page double-clicks never
+            // suspend a browser from tiling.
+            guard point.y <= frame.minY + titleHeight else { continue }
+            let id = CGWindowID(number.uint32Value)
+            pendingNativeZoomWindowID = id
             pendingNativeZoomAt = CACurrentMediaTime()
+            if !zoomSuspendedWindowIDs.contains(id) {
+                // Suspend immediately, before macOS finishes its zoom
+                // animation, so the 250 ms layout pass cannot snap it back.
+                zoomSuspendedWindowIDs.insert(id)
+                zoomSuspendedAt[id] = CACurrentMediaTime()
+                animationTimer?.invalidate(); animationTimer = nil
+                animations.removeValue(forKey: id)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in self?.fillDisplayAfterNativeZoom(id) }
+            } else {
+                // The second native double-click means restore. Resume the
+                // existing Dwindle slot even if an app does not restore its
+                // pre-zoom frame consistently.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [weak self] in
+                    guard let self else { return }
+                    self.zoomSuspendedWindowIDs.remove(id)
+                    self.zoomSuspendedAt.removeValue(forKey: id)
+                    self.pendingNativeZoomWindowID = nil
+                    self.forceNextLayout = true
+                    self.tileVisibleApplications()
+                }
+            }
             return
         }
+    }
+
+    private func fillDisplayAfterNativeZoom(_ id: CGWindowID) {
+        guard enabled, zoomSuspendedWindowIDs.contains(id),
+              let window = visibleApplicationWindows().first(where: { $0.id == id }) else { return }
+        let available = availableFrame(for: window.screen)
+        // Native title-bar zoom varies by application (Safari and Chrome may
+        // choose an "ideal" content size). Ryft preserves the native action but
+        // normalizes the result to the same safe full-display frame used when
+        // a desktop contains one tiled window.
+        if frameDifference(window.frame, available) > 3 { setFrame(available, for: window.element, id: id) }
+        expectedFrames.removeValue(forKey: id)
     }
 
     private func allWindowIDs() -> Set<CGWindowID> {
