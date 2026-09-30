@@ -208,14 +208,10 @@ final class DwindleTilingService: ObservableObject {
             }
         }
 
-        if !zoomSuspendedWindowIDs.isEmpty {
-            // Maximizing is a temporary native mode, not a layout membership
-            // change. Freeze every other tile in place until the user restores
-            // the maximized window, preventing panes from jumping underneath it.
-            managedApplicationCount = windows.count
-            status = "Tiling paused for maximized window"
-            return
-        }
+        // Keep maximized windows in their existing layout slots. Their frames
+        // are skipped below, while every other window continues receiving its
+        // normal target. This avoids both layout collapse and a stale maximize
+        // state disabling the entire tiler.
         let grouped = Dictionary(grouping: windows, by: { displayID(for: $0.screen) })
 
         var tiledIDs = Set<CGWindowID>()
@@ -232,9 +228,11 @@ final class DwindleTilingService: ObservableObject {
             let frames = dwindleLayout(count: ordered.count, in: frame, ratios: ratios).frames
             for (window, target) in zip(ordered, frames) {
                 if originalWindows[window.id] == nil { originalWindows[window.id] = OriginalWindow(frame: window.frame, element: window.element) }
-                setFrame(target, for: window.element, id: window.id)
                 nextExpectedFrames[window.id] = target
                 tiledIDs.insert(window.id)
+                if !zoomSuspendedWindowIDs.contains(window.id) {
+                    setFrame(target, for: window.element, id: window.id)
+                }
             }
         }
 
@@ -250,11 +248,10 @@ final class DwindleTilingService: ObservableObject {
         managedApplicationCount = tiledApplicationCount
         let suspended = zoomSuspendedWindowIDs.count
         switch (tiledApplicationCount, suspended) {
-        case (0, 0): status = "Waiting for an application"
-        case (0, let count): status = "Leaving \(count) window\(count == 1 ? "" : "s") maximized"
+        case (0, _): status = "Waiting for an application"
         case (1, 0): status = "Filling the display with 1 window"
         case (let count, 0): status = "Tiling \(count) windows"
-        case (let count, let maximized): status = "Tiling \(count) · \(maximized) maximized"
+        case (let count, let maximized): status = "Tiling \(count) windows · \(maximized) maximized"
         }
     }
 
@@ -274,9 +271,11 @@ final class DwindleTilingService: ObservableObject {
                     zoomSuspendedWindowIDs.remove(window.id)
                     zoomSuspendedAt.removeValue(forKey: window.id)
                 }
-            } else if pendingNativeZoomWindowID == window.id,
-                      let expected = expectedFrames[window.id], coversDisplay,
+            } else if let expected = expectedFrames[window.id], coversDisplay,
                       frameDifference(window.frame, expected) > 40 {
+                // Fallback for systems where the global mouse monitor is not
+                // delivered: observe macOS's completed zoom frame before this
+                // layout pass can overwrite it.
                 animationTimer?.invalidate(); animationTimer = nil
                 animations.removeValue(forKey: window.id)
                 zoomSuspendedWindowIDs.insert(window.id)
@@ -340,7 +339,6 @@ final class DwindleTilingService: ObservableObject {
         // normalizes the result to the same safe full-display frame used when
         // a desktop contains one tiled window.
         if frameDifference(window.frame, available) > 3 { setFrame(available, for: window.element, id: id) }
-        expectedFrames.removeValue(forKey: id)
     }
 
     private func allWindowIDs() -> Set<CGWindowID> {
