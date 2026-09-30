@@ -297,7 +297,10 @@ final class DwindleTilingService: ObservableObject {
                   let frame = CGRect(dictionaryRepresentation: bounds),
                   frame.contains(point),
                   let number = info[kCGWindowNumber] as? NSNumber else { continue }
-            let titleHeight = min(58, max(30, frame.height * 0.10))
+            // Browser chrome can include a tab strip, toolbar and profile row;
+            // keep the hit region broad enough for Safari/Chrome/Arc while
+            // remaining confined to the top of the window.
+            let titleHeight = min(104, max(36, frame.height * 0.12))
             // CGWindow and CGEvent both use Quartz's top-left display space.
             // Restrict this to title/tab chrome so page double-clicks never
             // suspend a browser from tiling.
@@ -319,11 +322,21 @@ final class DwindleTilingService: ObservableObject {
                 // pre-zoom frame consistently.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [weak self] in
                     guard let self else { return }
+                    // AX frame writes used to normalize browser zoom can erase
+                    // AppKit's private restore frame. Restore the exact Dwindle
+                    // slot ourselves before reenabling correction, otherwise
+                    // fallback maximize detection can immediately suspend it
+                    // again while it is still full-sized.
+                    if let target = self.expectedFrames[id],
+                       let window = self.visibleApplicationWindows().first(where: { $0.id == id }) {
+                        self.animations.removeValue(forKey: id)
+                        self.applyFrame(target, to: window.element)
+                    }
                     self.zoomSuspendedWindowIDs.remove(id)
                     self.zoomSuspendedAt.removeValue(forKey: id)
                     self.pendingNativeZoomWindowID = nil
                     self.forceNextLayout = true
-                    self.tileVisibleApplications()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.tileVisibleApplications() }
                 }
             }
             return
