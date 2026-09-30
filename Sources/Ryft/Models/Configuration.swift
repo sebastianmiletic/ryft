@@ -48,11 +48,35 @@ enum BuiltInBarStyle: String, CaseIterable, Identifiable {
     }
 }
 
+enum TilingLayoutMode: String, Codable, CaseIterable, Identifiable {
+    case placementOnly = "Sizing & positioning"
+    case dwindle = "Hyprland Dwindle"
+    var id: String { rawValue }
+    var description: String {
+        switch self {
+        case .placementOnly: "Automatically sizes and positions windows in a balanced layout without Hyprland recursion, pane ratios, or swapping."
+        case .dwindle: "Recursively splits the remaining pane and supports interactive divider ratios and slot swapping."
+        }
+    }
+}
+
 struct TilingConfiguration: Codable, Equatable {
     var enabled = false
+    var mode: TilingLayoutMode = .placementOnly
     var excludedBundleIdentifiers: [String] = []
     var gap: Double = 10
     var outerGap: Double = 8
+
+    enum CodingKeys: String, CodingKey { case enabled, mode, excludedBundleIdentifiers, gap, outerGap }
+    init() {}
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        mode = try c.decodeIfPresent(TilingLayoutMode.self, forKey: .mode) ?? .placementOnly
+        excludedBundleIdentifiers = try c.decodeIfPresent([String].self, forKey: .excludedBundleIdentifiers) ?? []
+        gap = try c.decodeIfPresent(Double.self, forKey: .gap) ?? 10
+        outerGap = try c.decodeIfPresent(Double.self, forKey: .outerGap) ?? 8
+    }
 }
 
 struct NamedBarProfile: Codable, Equatable, Identifiable {

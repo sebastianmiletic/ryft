@@ -130,7 +130,7 @@ private struct PageHeader: View {
         case .permissions: "Control exactly which macOS features Ryft can access."
         case .guide: "The essential controls, shortcuts, and everyday workflow."
         case .waybar: "Configure the bar, themes, geometry, and widgets in one place."
-        case .tiling: "Automatically arrange new windows with a Hyprland-style Dwindle layout."
+        case .tiling: "Automatically size and position windows with balanced or optional Dwindle layouts."
         case .assistant: "Configure Gemini, selected-text answers, model routing, and privacy."
         case .shortcuts: "Map global controls that work from any app."
         case .wallpapers: "Pick an image for every connected display."
@@ -171,9 +171,14 @@ struct TilingSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            SettingsGroup("Automatic Dwindle tiling") {
-                Toggle("Tile applications automatically", isOn: $model.configuration.tiling.enabled)
+            SettingsGroup("Automatic window layout") {
+                Toggle("Size and position windows automatically", isOn: $model.configuration.tiling.enabled)
                     .toggleStyle(.switch)
+                Picker("Layout behavior", selection: $model.configuration.tiling.mode) {
+                    ForEach(TilingLayoutMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
+                }.pickerStyle(.segmented)
+                Text(model.configuration.tiling.mode.description)
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {
                     Circle().fill(model.configuration.tiling.enabled ? statusColor : Color.secondary.opacity(0.45)).frame(width: 8, height: 8)
                     Text(engine.status).font(.callout).foregroundStyle(.secondary)
@@ -182,7 +187,7 @@ struct TilingSettingsView: View {
                         Button("Review Accessibility") { engine.openAccessibilitySettings() }.buttonStyle(.bordered)
                     }
                 }
-                Text("The Dwindle engine is built directly into Ryft. There is no helper application, second menu-bar item, download, or separate set of shortcuts.")
+                Text("Both modes are built directly into Ryft. Sizing & positioning provides automatic balanced placement without Hyprland behavior; Dwindle remains available as an optional advanced layout.")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             SettingsGroup("Layout tuning") {
@@ -202,17 +207,21 @@ struct TilingSettingsView: View {
                     }
                 }
                 Button { addException() } label: { Label("Add application exception", systemImage: "plus") }.buttonStyle(SettingsHoverButtonStyle())
-                Text("Excluded apps keep their own position and size and do not occupy a Dwindle slot.").font(.caption).foregroundStyle(.secondary)
+                Text("Excluded apps keep their own position and size and do not occupy an automatic layout slot.").font(.caption).foregroundStyle(.secondary)
             }
             SettingsGroup("When Ryft rearranges windows") {
                 Label("One visible window fills the complete safe work area.", systemImage: "rectangle")
                 Label("A second window creates equal halves, even when both belong to the same application.", systemImage: "rectangle.split.2x1")
-                Label("A third window splits the right pane; later windows recursively split the remainder.", systemImage: "rectangle.split.2x2")
-                Label("Drag a tiled window edge to resize its pane and the neighboring pane together.", systemImage: "arrow.left.and.right")
-                Label("Drag a tiled window by its title bar into another pane to swap both applications.", systemImage: "arrow.triangle.swap")
+                if model.configuration.tiling.mode == .placementOnly {
+                    Label("Additional windows form balanced rows and columns.", systemImage: "rectangle.grid.2x2")
+                    Label("Ryft controls only automatic size and position—recursive splits, pane ratios, and slot swapping are off.", systemImage: "move.3d")
+                } else {
+                    Label("A third window splits the right pane; later windows recursively split the remainder.", systemImage: "rectangle.split.2x2")
+                    Label("Drag a tiled edge to resize neighboring panes, or drag a title bar into another pane to swap them.", systemImage: "arrow.triangle.swap")
+                }
                 Label("The bar, Dock, display edges, fullscreen, minimized, and fixed-size windows stay clear.", systemImage: "arrow.down.right.and.arrow.up.left")
                 Label("Closing back to one application restores its original frame.", systemImage: "arrow.uturn.backward")
-                Text("Ryft manages every resizable standard window visible on each display of the active Mission Control desktop, including multiple windows from one application. Changing the bar edge or size immediately reflows all tiles so none overlap the bar, Dock, or display boundary. Turn tiling off to restore original frames and stop automatic placement.")
+                Text("Ryft manages every resizable standard window visible on each display of the active Mission Control desktop, including multiple windows from one application. Changing the bar edge or size immediately reflows all windows so none overlap the bar, Dock, or display boundary. Turn automatic layout off to restore original frames.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

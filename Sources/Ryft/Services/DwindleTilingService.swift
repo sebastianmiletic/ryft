@@ -204,7 +204,7 @@ final class DwindleTilingService: ObservableObject {
             pointerBaseline.removeAll()
             if pointerInteractionActive {
                 pointerInteractionActive = false
-                if !newlyZoomed { absorbPointerInteraction(windows: windows, grouped: interactionGroups) }
+                if !newlyZoomed && configuration.mode == .dwindle { absorbPointerInteraction(windows: windows, grouped: interactionGroups) }
             }
         }
 
@@ -224,8 +224,13 @@ final class DwindleTilingService: ObservableObject {
 
             tiledApplicationCount += ordered.count
             let frame = availableFrame(for: screen)
-            let ratios = ratios(for: LayoutKey(display: display, desktop: activeDesktop), count: ordered.count)
-            let frames = dwindleLayout(count: ordered.count, in: frame, ratios: ratios).frames
+            let frames: [CGRect]
+            if configuration.mode == .dwindle {
+                let ratios = ratios(for: LayoutKey(display: display, desktop: activeDesktop), count: ordered.count)
+                frames = dwindleLayout(count: ordered.count, in: frame, ratios: ratios).frames
+            } else {
+                frames = balancedLayout(count: ordered.count, in: frame)
+            }
             for (window, target) in zip(ordered, frames) {
                 if originalWindows[window.id] == nil { originalWindows[window.id] = OriginalWindow(frame: window.frame, element: window.element) }
                 nextExpectedFrames[window.id] = target
@@ -678,6 +683,32 @@ final class DwindleTilingService: ObservableObject {
             splitRatios[key] = ratios
             status = "Adjusted tile split"
         }
+    }
+
+    private func balancedLayout(count: Int, in frame: CGRect) -> [CGRect] {
+        guard count > 0 else { return [] }
+        guard count > 1 else { return [frame.integral] }
+        let columns = max(1, Int(ceil(sqrt(Double(count)))))
+        let rows = max(1, Int(ceil(Double(count) / Double(columns))))
+        let gap = CGFloat(max(0, min(configuration.gap, 40)))
+        let rowHeight = max(1, (frame.height - gap * CGFloat(rows - 1)) / CGFloat(rows))
+        var result: [CGRect] = []
+        var index = 0
+        for row in 0..<rows {
+            let remaining = count - index
+            let itemsInRow = min(columns, remaining)
+            let itemWidth = max(1, (frame.width - gap * CGFloat(itemsInRow - 1)) / CGFloat(itemsInRow))
+            for column in 0..<itemsInRow {
+                result.append(CGRect(
+                    x: frame.minX + CGFloat(column) * (itemWidth + gap),
+                    y: frame.minY + CGFloat(row) * (rowHeight + gap),
+                    width: itemWidth,
+                    height: rowHeight
+                ).integral)
+                index += 1
+            }
+        }
+        return result
     }
 
     private func dwindleLayout(count: Int, in frame: CGRect, ratios: [CGFloat]) -> (frames: [CGRect], splits: [LayoutSplit]) {
