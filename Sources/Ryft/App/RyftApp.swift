@@ -34,14 +34,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        // Hide Apple's menu surface before creating any Ryft windows so there
-        // is no launch-frame flash beneath the desktop bar.
-        NSMenu.setMenuBarVisible(false)
         let model = AppModel.shared
-        _ = model.notifications
-        // Capture the native menu-bar boundary before Ryft hides it. This exact
-        // per-display height is reused by the wallpaper cover and window tiler.
+        // Measure before hiding Apple's menu. Thin bars and secondary displays
+        // still need the real native boundary, not a post-hide zero inset.
         NSScreen.screens.forEach { _ = DisplayLayoutMetrics.menuBarHeight(for: $0) }
+        // Hide Apple's menu surface before creating any Ryft panels.
+        NSMenu.setMenuBarVisible(false)
+        _ = model.notifications
         barController = BarPanelController(model: model)
         wallpaperController = WallpaperWindowController(model: model)
         sidePanelController = SidePanelController(model: model)

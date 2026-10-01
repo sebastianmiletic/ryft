@@ -187,12 +187,28 @@ struct TilingSettingsView: View {
                         Button("Review Accessibility") { engine.openAccessibilitySettings() }.buttonStyle(.bordered)
                     }
                 }
-                Text("Both modes are built directly into Ryft. Sizing & positioning provides automatic balanced placement without Hyprland behavior; Dwindle remains available as an optional advanced layout.")
+                Text("Both modes are built into Ryft. Dwindle follows Hyprland’s persistent split-tree rules; Sizing & positioning remains a simpler balanced-grid alternative.")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             SettingsGroup("Layout tuning") {
                 ValueSlider("Window gap", value: $model.configuration.tiling.gap, range: 0...32, suffix: "pt")
                 ValueSlider("Display edge gap", value: $model.configuration.tiling.outerGap, range: 0...32, suffix: "pt")
+            }
+            if model.configuration.tiling.mode == .dwindle {
+                SettingsGroup("Hyprland Dwindle rules") {
+                    Toggle("Split the focused window", isOn: $model.configuration.tiling.useActiveForSplits)
+                    Text("When off, the cursor chooses the pane to split.").font(.caption).foregroundStyle(.secondary)
+                    Picker("New window side", selection: $model.configuration.tiling.newWindowPlacement) {
+                        ForEach(DwindleWindowPlacement.allCases) { placement in Text(placement.rawValue).tag(placement) }
+                    }
+                    Toggle("Preserve split directions", isOn: $model.configuration.tiling.preserveSplit)
+                    Text("When off, wide containers split left/right and tall containers split top/bottom, as in Hyprland.").font(.caption).foregroundStyle(.secondary)
+                    ValueSlider("Split width multiplier", value: $model.configuration.tiling.splitWidthMultiplier, range: 0.1...3, suffix: "×", decimalPlaces: 2)
+                    ValueSlider("Default split ratio", value: $model.configuration.tiling.defaultSplitRatio, range: 0.1...1.9, suffix: "", decimalPlaces: 2)
+                    Text("A ratio of 1 means equal halves. Ratios of 0.1–1.9 mean 5–95% for the first pane. Each divider keeps its own ratio on its own desktop.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Link("Hyprland Dwindle documentation", destination: URL(string: "https://wiki.hypr.land/configuring/layouts/dwindle-layout/")!)
+                }
             }
             SettingsGroup("Application exceptions") {
                 if model.configuration.tiling.excludedBundleIdentifiers.isEmpty {
@@ -211,16 +227,17 @@ struct TilingSettingsView: View {
             }
             SettingsGroup("When Ryft rearranges windows") {
                 Label("One visible window fills the complete safe work area.", systemImage: "rectangle")
-                Label("A second window creates equal halves, even when both belong to the same application.", systemImage: "rectangle.split.2x1")
+                Label("A second window splits the desktop, including windows from the same application.", systemImage: "rectangle.split.2x1")
                 if model.configuration.tiling.mode == .placementOnly {
                     Label("Additional windows form balanced rows and columns.", systemImage: "rectangle.grid.2x2")
                     Label("Ryft controls only automatic size and position—recursive splits, pane ratios, and slot swapping are off.", systemImage: "move.3d")
                 } else {
-                    Label("A third window splits the right pane; later windows recursively split the remainder.", systemImage: "rectangle.split.2x2")
+                    Label("Each new window splits the focused or cursor-selected leaf; closing promotes its sibling without rebuilding other branches.", systemImage: "rectangle.split.2x2")
                     Label("Drag a tiled edge to resize neighboring panes, or drag a title bar into another pane to swap them.", systemImage: "arrow.triangle.swap")
                 }
                 Label("The bar, Dock, display edges, fullscreen, minimized, and fixed-size windows stay clear.", systemImage: "arrow.down.right.and.arrow.up.left")
-                Label("Closing back to one application restores its original frame.", systemImage: "arrow.uturn.backward")
+                Label("Double-click a title bar to maximize; double-click again to restore its exact tile. Native fullscreen is never resized.", systemImage: "arrow.up.left.and.arrow.down.right")
+                Label("Minimized windows keep their tree slots. Turn automatic layout off to restore visible windows’ original frames.", systemImage: "arrow.uturn.backward")
                 Text("Ryft manages every resizable standard window visible on each display of the active Mission Control desktop, including multiple windows from one application. Changing the bar edge or size immediately reflows all windows so none overlap the bar, Dock, or display boundary. Turn automatic layout off to restore original frames.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -293,6 +310,7 @@ private enum DeviceDetails {
 
 private struct CurrentBarInspector: View {
     @ObservedObject var model: AppModel
+    @Environment(\.displayScale) private var displayScale
     private var bar: BarConfiguration { model.configuration.bar }
     private var screenWidth: CGFloat { NSScreen.main?.frame.width ?? 1440 }
     private var notchWidth: CGFloat {
@@ -300,10 +318,10 @@ private struct CurrentBarInspector: View {
               let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea else { return bar.manualNotchWidth }
         return bar.manualNotchWidth > 0 ? CGFloat(bar.manualNotchWidth) : max(0, right.minX - left.maxX)
     }
-    private var shelfHeight: CGFloat { bar.notchMaskEnabled ? (bar.notchMaskHeight > 0 ? CGFloat(bar.notchMaskHeight) : max(NSScreen.main?.safeAreaInsets.top ?? 0, 32)) : 0 }
-    private var barInsets: CGFloat { bar.presentation == .top ? 0 : bar.outerInset * 2 }
-    private var previewWidth: CGFloat { bar.position.isVertical ? bar.height + barInsets : screenWidth }
-    private var previewHeight: CGFloat { bar.position.isVertical ? min(NSScreen.main?.frame.height ?? 900, 520) : bar.height + barInsets + shelfHeight }
+    private var shelfHeight: CGFloat { DisplayLayoutMetrics.previewShelfHeight(bar) }
+    private var thickness: CGFloat { DisplayLayoutMetrics.barThickness(bar, shelf: shelfHeight, scale: displayScale) }
+    private var previewWidth: CGFloat { bar.position.isVertical ? thickness : screenWidth }
+    private var previewHeight: CGFloat { bar.position.isVertical ? min(NSScreen.main?.frame.height ?? 900, 520) : thickness }
     var body: some View {
         ScrollView([.horizontal, .vertical], showsIndicators: true) {
             BarView(model: model, notchWidth: notchWidth, topReservedHeight: bar.position == .top ? shelfHeight : 0)
@@ -320,6 +338,7 @@ private struct CurrentBarInspector: View {
 
 private struct BarStylePreview: View {
     @ObservedObject var model: AppModel
+    @Environment(\.displayScale) private var displayScale
     let style: BuiltInBarStyle
     private var preview: BarConfiguration {
         var value = model.barConfiguration(for: style)
@@ -335,7 +354,7 @@ private struct BarStylePreview: View {
                     ZStack {
                         LinearGradient(colors: [Color(hex: preview.palette.muted).opacity(0.3), Color(hex: preview.palette.background).opacity(0.75)], startPoint: .topLeading, endPoint: .bottomTrailing)
                         BarView(model: model, notchWidth: (preview.reserveNotchSpace || preview.splitAroundNotch) ? 160 : 0, topReservedHeight: 0, configurationOverride: preview)
-                            .frame(width: sourceWidth, height: preview.height + (preview.presentation == .top ? 0 : preview.outerInset * 2))
+                            .frame(width: sourceWidth, height: DisplayLayoutMetrics.barThickness(preview, scale: displayScale))
                             .scaleEffect(scale, anchor: .center)
                             .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
                             .allowsHitTesting(false)
@@ -449,10 +468,15 @@ struct BarSettingsView: View {
 
 struct ValueSlider: View {
     let name: String; @Binding var value: Double; let range: ClosedRange<Double>; let suffix: String
-    init(_ name: String, value: Binding<Double>, range: ClosedRange<Double>, suffix: String) { self.name = name; _value = value; self.range = range; self.suffix = suffix }
+    let decimalPlaces: Int?
+    init(_ name: String, value: Binding<Double>, range: ClosedRange<Double>, suffix: String, decimalPlaces: Int? = nil) { self.name = name; _value = value; self.range = range; self.suffix = suffix; self.decimalPlaces = decimalPlaces }
+    private var formattedValue: String {
+        if let decimalPlaces { return String(format: "%.*f", decimalPlaces, value) + (suffix.isEmpty ? "" : " \(suffix)") }
+        return suffix.isEmpty ? String(format: "%.0f%%", value * 100) : "\(Int(value)) \(suffix)"
+    }
     var body: some View {
         VStack(spacing: 5) {
-            HStack { Text(name); Spacer(); Text(suffix.isEmpty ? String(format: "%.0f%%", value * 100) : "\(Int(value)) \(suffix)").monospacedDigit().foregroundStyle(.secondary) }
+            HStack { Text(name); Spacer(); Text(formattedValue).monospacedDigit().foregroundStyle(.secondary) }
             Slider(value: $value, in: range)
         }
     }

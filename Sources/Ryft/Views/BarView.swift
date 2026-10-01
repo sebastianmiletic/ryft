@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import RyftWindowLayout
 
 private enum BarImageCache {
     static let images = NSCache<NSString, NSImage>()
@@ -15,6 +16,7 @@ struct BarView: View {
     @ObservedObject var model: AppModel
     @ObservedObject private var system: SystemMonitor
     @ObservedObject private var workspaces: WorkspaceService
+    @Environment(\.displayScale) private var displayScale
     let notchWidth: Double
     let topReservedHeight: Double
     let configurationOverride: BarConfiguration?
@@ -43,9 +45,9 @@ struct BarView: View {
     private func horizontalBar(in size: CGSize) -> some View {
         let contentInset: Double = 12
         let outerX = config.presentation == .floating ? config.horizontalInset : 0
-        let verticalInset = config.presentation == .top ? 0 : config.outerInset
+        let verticalInset = config.presentation == .top ? 0 : PixelGrid.ceil(config.outerInset, scale: displayScale)
         let barWidth = max(0, size.width - outerX * 2)
-        let barHeight = max(0, size.height - topReservedHeight - verticalInset * 2)
+        let barHeight = max(0, size.height - topReservedHeight - verticalInset * (config.position == .top ? 1 : 2))
         let sideWidth = max(0, (barWidth - contentInset * 2 - effectiveNotchWidth) / 2)
         return ZStack(alignment: .top) {
             if topReservedHeight > 0 { TrueBlackView().frame(width: size.width, height: topReservedHeight) }
@@ -997,12 +999,16 @@ struct WidgetIcon: View {
 struct EditableBarCanvas: View {
     @ObservedObject var model: AppModel
     @Binding var selectedWidgetID: UUID?
+    @Environment(\.displayScale) private var displayScale
+    private var bar: BarConfiguration { model.configuration.bar }
+    private var shelfHeight: CGFloat { DisplayLayoutMetrics.previewShelfHeight(bar) }
+    private var thickness: CGFloat { DisplayLayoutMetrics.barThickness(bar, shelf: shelfHeight, scale: displayScale) }
     var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .top) {
                 LinearGradient(colors: [Color(hex: model.configuration.bar.palette.muted).opacity(0.28), Color(hex: model.configuration.bar.palette.background).opacity(0.7)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                BarView(model: model, notchWidth: (model.configuration.bar.reserveNotchSpace || model.configuration.bar.splitAroundNotch) && !model.configuration.bar.notchMaskEnabled ? min(180, proxy.size.width * 0.18) : 0, topReservedHeight: model.configuration.bar.position == .top && model.configuration.bar.notchMaskEnabled ? 32 : 0, editing: true) { selectedWidgetID = $0 }
-                    .frame(width: model.configuration.bar.position.isVertical ? model.configuration.bar.height + (model.configuration.bar.presentation == .top ? 0 : model.configuration.bar.outerInset * 2) : proxy.size.width)
+                BarView(model: model, notchWidth: (bar.reserveNotchSpace || bar.splitAroundNotch) && !bar.notchMaskEnabled ? min(180, proxy.size.width * 0.18) : 0, topReservedHeight: shelfHeight, editing: true) { selectedWidgetID = $0 }
+                    .frame(width: bar.position.isVertical ? thickness : proxy.size.width, height: bar.position.isVertical ? nil : thickness)
                     .frame(maxWidth: .infinity, alignment: model.configuration.bar.position == .right ? .trailing : .leading)
                 Text("Drag widgets directly on the bar. The center spacing previews notch avoidance without drawing the notch.")
                     .font(.caption).foregroundStyle(.white.opacity(0.82)).padding(.horizontal, 10).padding(.vertical, 6)
@@ -1017,16 +1023,20 @@ struct EditableBarCanvas: View {
 
 struct BarPreview: View {
     @ObservedObject var model: AppModel
+    @Environment(\.displayScale) private var displayScale
+    private var bar: BarConfiguration { model.configuration.bar }
+    private var shelfHeight: CGFloat { DisplayLayoutMetrics.previewShelfHeight(bar) }
+    private var thickness: CGFloat { DisplayLayoutMetrics.barThickness(bar, shelf: shelfHeight, scale: displayScale) }
     var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .top) {
                 LinearGradient(colors: [Color(hex: model.configuration.bar.palette.muted).opacity(0.34), Color(hex: model.configuration.bar.palette.background).opacity(0.72)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                BarView(model: model, notchWidth: (model.configuration.bar.reserveNotchSpace || model.configuration.bar.splitAroundNotch) && !model.configuration.bar.notchMaskEnabled ? min(180, proxy.size.width * 0.18) : 0, topReservedHeight: model.configuration.bar.position == .top && model.configuration.bar.notchMaskEnabled ? 32 : 0)
-                    .frame(width: model.configuration.bar.position.isVertical ? model.configuration.bar.height + (model.configuration.bar.presentation == .top ? 0 : model.configuration.bar.outerInset * 2) : proxy.size.width)
+                BarView(model: model, notchWidth: (bar.reserveNotchSpace || bar.splitAroundNotch) && !bar.notchMaskEnabled ? min(180, proxy.size.width * 0.18) : 0, topReservedHeight: shelfHeight)
+                    .frame(width: bar.position.isVertical ? thickness : proxy.size.width, height: bar.position.isVertical ? nil : thickness)
                     .frame(maxWidth: .infinity, alignment: model.configuration.bar.position == .right ? .trailing : .leading)
             }
         }
-        .frame(height: model.configuration.bar.position.isVertical ? 260 : max(86, model.configuration.bar.height + (model.configuration.bar.presentation == .top ? 0 : model.configuration.bar.outerInset * 2) + 28 + (model.configuration.bar.notchMaskEnabled ? 32 : 0)))
+        .frame(height: bar.position.isVertical ? 260 : max(86, thickness + 28))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(.primary.opacity(0.1)))
     }

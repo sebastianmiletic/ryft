@@ -130,9 +130,9 @@ final class SidePanelController {
             usable.size.height = max(0, min(usable.maxY, coverBottom) - usable.minY)
         }
         if bar.enabled {
-            let shelf = bar.position == .top && bar.notchMaskEnabled ? (bar.notchMaskHeight > 0 ? bar.notchMaskHeight : Double(screen.safeAreaInsets.top)) : 0
-            let barInsets = bar.presentation == .top ? 0 : bar.outerInset * 2
-            let reserved = CGFloat(bar.height + barInsets + shelf) + 6
+            let frame = DisplayLayoutMetrics.barFrame(for: screen, bar: bar)
+            let thickness = bar.position.isVertical ? frame.width : frame.height
+            let reserved = (bar.position == .top ? max(thickness, DisplayLayoutMetrics.menuBarCoverFrame(for: screen, bar: bar).height) : thickness) + 6
             switch bar.position {
             case .top: usable.size.height = max(0, min(usable.maxY, screen.frame.maxY - reserved) - usable.minY)
             case .bottom:

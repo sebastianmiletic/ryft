@@ -55,24 +55,39 @@ enum TilingLayoutMode: String, Codable, CaseIterable, Identifiable {
     var description: String {
         switch self {
         case .placementOnly: "Automatically sizes and positions windows in a balanced layout without Hyprland recursion, pane ratios, or swapping."
-        case .dwindle: "Recursively splits the remaining pane and supports interactive divider ratios and slot swapping."
+        case .dwindle: "Keeps a binary tree per desktop. New windows split the focused or cursor-selected pane, with native maximize and exact tile restoration."
         }
     }
 }
 
+enum DwindleWindowPlacement: String, Codable, CaseIterable, Identifiable {
+    case cursor = "Follow cursor", before = "Left or top", after = "Right or bottom"
+    var id: String { rawValue }
+}
+
 struct TilingConfiguration: Codable, Equatable {
     var enabled = false
-    var mode: TilingLayoutMode = .placementOnly
+    var mode: TilingLayoutMode = .dwindle
+    var preserveSplit = false
+    var useActiveForSplits = true
+    var splitWidthMultiplier: Double = 1
+    var defaultSplitRatio: Double = 1
+    var newWindowPlacement: DwindleWindowPlacement = .cursor
     var excludedBundleIdentifiers: [String] = []
     var gap: Double = 10
     var outerGap: Double = 8
 
-    enum CodingKeys: String, CodingKey { case enabled, mode, excludedBundleIdentifiers, gap, outerGap }
+    enum CodingKeys: String, CodingKey { case enabled, mode, preserveSplit, useActiveForSplits, splitWidthMultiplier, defaultSplitRatio, newWindowPlacement, excludedBundleIdentifiers, gap, outerGap }
     init() {}
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
-        mode = try c.decodeIfPresent(TilingLayoutMode.self, forKey: .mode) ?? .placementOnly
+        mode = try c.decodeIfPresent(TilingLayoutMode.self, forKey: .mode) ?? .dwindle
+        preserveSplit = try c.decodeIfPresent(Bool.self, forKey: .preserveSplit) ?? false
+        useActiveForSplits = try c.decodeIfPresent(Bool.self, forKey: .useActiveForSplits) ?? true
+        splitWidthMultiplier = min(3, max(0.1, try c.decodeIfPresent(Double.self, forKey: .splitWidthMultiplier) ?? 1))
+        defaultSplitRatio = min(1.9, max(0.1, try c.decodeIfPresent(Double.self, forKey: .defaultSplitRatio) ?? 1))
+        newWindowPlacement = try c.decodeIfPresent(DwindleWindowPlacement.self, forKey: .newWindowPlacement) ?? .cursor
         excludedBundleIdentifiers = try c.decodeIfPresent([String].self, forKey: .excludedBundleIdentifiers) ?? []
         gap = try c.decodeIfPresent(Double.self, forKey: .gap) ?? 10
         outerGap = try c.decodeIfPresent(Double.self, forKey: .outerGap) ?? 8
@@ -350,7 +365,7 @@ struct RyftConfiguration: Codable, Equatable {
     var adaptColorsToWallpaper = true
     var todos: [TodoConfiguration] = []
     var savedBars: [NamedBarProfile] = []
-    var sourcePresetVersion = 17
+    var sourcePresetVersion = 18
     var launchAtLogin = false
     var hasCompletedOnboarding = false
     var tiling = TilingConfiguration()

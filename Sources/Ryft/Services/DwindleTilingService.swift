@@ -2,743 +2,414 @@ import AppKit
 import ApplicationServices
 import Combine
 import QuartzCore
+import RyftWindowLayout
 
-/// Ryft-owned automatic Dwindle tiling. The engine manages every resizable
-/// standard window visible on the active desktop, including multiple windows
-/// from one application. Each additional window recursively splits the layout.
+/// Native macOS adapter for a persistent, workspace-local Hyprland-style BSP
+/// tree. Layout, native zoom, pointer gestures and AX writes are separate states.
 final class DwindleTilingService: ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var status = "Automatic tiling is off"
     @Published private(set) var managedApplicationCount = 0
 
-    private struct ManagedWindow {
-        let id: CGWindowID
-        let pid: pid_t
-        let element: AXUIElement
-        let frame: CGRect
-        let screen: NSScreen
+    private struct WorkspaceLayout {
+        var tree = DwindleTree()
+        var focused: CGWindowID?
+        var layout = DwindleTree.Layout()
+        var area = CGRect.zero
     }
-
-    private struct OriginalWindow {
+    private struct Original {
         let frame: CGRect
         let element: AXUIElement
     }
-
-    private struct FrameAnimation {
-        let element: AXUIElement
+    private struct Animation {
+        let window: TilingWindowObservation
+        let key: TilingLayoutKey
         let from: CGRect
         let to: CGRect
-        let startedAt: CFTimeInterval
-        let duration: CFTimeInterval
+        let requested: CGRect
+        let start: CFTimeInterval
+    }
+    private struct Gesture {
+        enum Kind { case title, edge, content }
+        let id: CGWindowID
+        let key: TilingLayoutKey
+        let kind: Kind
+        let point: CGPoint
+        let frame: CGRect
+        var dragged = false
+        var releasedAt: CFTimeInterval?
     }
 
-    private enum SplitAxis { case horizontal, vertical }
-    private struct LayoutKey: Hashable {
-        let display: CGDirectDisplayID
-        let desktop: Int
-    }
-    private struct LayoutSplit {
-        let index: Int
-        let axis: SplitAxis
-        let container: CGRect
-        let boundary: CGFloat
-    }
-
+    private let spaces = TilingSpaceContext()
+    private let bridge = TilingWindowBridge()
+    private var configuration = TilingConfiguration()
+    private var bar = BarConfiguration()
     private var enabled = false
+    private var fallbackDesktop = 1
+    private var layouts: [TilingLayoutKey: WorkspaceLayout] = [:]
+    private var assignments: [CGWindowID: TilingLayoutKey] = [:]
+    private var originals: [CGWindowID: Original] = [:]
+    private var presentations: [CGWindowID: WindowPresentation] = [:]
+    private var minimums: [CGWindowID: CGSize] = [:]
+    private var nativeTiles = NativeTileMemory()
+    private var writeBackoff: [CGWindowID: CFTimeInterval] = [:]
+    private var observed: [TilingWindowObservation] = []
+    private var contexts: [TilingDisplayContext] = []
+    private var gesture: Gesture?
+    private var settleUntil: CFTimeInterval = 0
+    private var lastTitleDown: (id: CGWindowID, frame: CGRect, at: CFTimeInterval)?
+    private let traceURL = ProcessInfo.processInfo.environment["RYFT_TILING_TRACE"].map { URL(fileURLWithPath: $0) }
+    private var pendingSignature = ""
+    private var stableObservations = 0
     private var timer: Timer?
     private var animationTimer: Timer?
-    private var animations: [CGWindowID: FrameAnimation] = [:]
-    private var bar = BarConfiguration()
-    private var configuration = TilingConfiguration()
-    private var originalWindows: [CGWindowID: OriginalWindow] = [:]
-    private var zoomSuspendedWindowIDs = Set<CGWindowID>()
-    private var zoomSuspendedAt: [CGWindowID: CFTimeInterval] = [:]
-    private var pendingNativeZoomWindowID: CGWindowID?
-    private var pendingNativeZoomAt: CFTimeInterval = 0
-    private var doubleClickMonitor: Any?
-    private var windowOrder: [CGWindowID: Int] = [:]
-    private var nextOrder = 0
-    private var appliedLayoutSignature: [String] = []
-    private var pendingLayoutSignature: [String] = []
-    private var pendingLayoutObservations = 0
-    private var forceNextLayout = true
-    private var expectedFrames: [CGWindowID: CGRect] = [:]
-    private var splitRatios: [LayoutKey: [CGFloat]] = [:]
-    private var activeDesktop = 1
-    private var pointerWasDown = false
-    private var pointerInteractionActive = false
-    private var pointerBaseline: [CGWindowID: CGRect] = [:]
+    private var animations: [CGWindowID: Animation] = [:]
+    private var eventMonitor: Any?
+    private var observers: [NSObjectProtocol] = []
 
     init() {
-        doubleClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
-            guard event.clickCount >= 2, let point = event.cgEvent?.location else { return }
-            self?.recordNativeTitleBarDoubleClick(at: point)
-        }
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] in self?.pointerEvent($0) }
+        observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in self?.spaceChanged() })
+        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in self?.spaceChanged() })
+        observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in self?.spaceChanged() })
     }
-
     deinit {
-        if let doubleClickMonitor { NSEvent.removeMonitor(doubleClickMonitor) }
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
+        observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0); NotificationCenter.default.removeObserver($0) }
+        timer?.invalidate(); animationTimer?.invalidate()
     }
 
     func setEnabled(_ value: Bool) {
-        enabled = value
+        guard enabled != value else { return }
+        enabled = value; running = value
+        if traceURL != nil { NSLog("Ryft tiling enabled: %@", value.description) }
+        cancelAnimations()
         if value {
-            forceNextLayout = true
-            running = true
-            status = AXIsProcessTrusted() ? "Waiting for an application" : "Accessibility permission needed"
-            startTimer()
-            tileVisibleApplications()
+            pendingSignature = ""; stableObservations = 0
+            let timer = Timer(timeInterval: 0.15, repeats: true) { [weak self] _ in self?.refresh() }
+            RunLoop.main.add(timer, forMode: .common); self.timer = timer
+            refresh()
         } else {
-            restoreManagedWindows(animated: true)
             timer?.invalidate(); timer = nil
-            expectedFrames.removeAll(); splitRatios.removeAll(); zoomSuspendedWindowIDs.removeAll(); zoomSuspendedAt.removeAll(); pendingNativeZoomWindowID = nil; pointerWasDown = false; pointerInteractionActive = false; pointerBaseline.removeAll()
-            running = false
-            managedApplicationCount = 0
-            status = "Automatic tiling is off"
+            restoreVisibleOriginals()
+            reset()
+            managedApplicationCount = 0; status = "Automatic tiling is off"
         }
     }
-
-    func updateBarConfiguration(_ configuration: BarConfiguration) {
-        guard bar != configuration else { return }
-        bar = configuration
-        forceNextLayout = true
-        if enabled { tileVisibleApplications() }
+    func updateConfiguration(_ value: TilingConfiguration) {
+        guard configuration != value else { return }
+        let changedMode = configuration.mode != value.mode
+        configuration = value
+        cancelAnimations(); gesture = nil
+        if changedMode {
+            // Keep the tree for switching back to Dwindle, but do not infer a
+            // native resize from the old layout's in-flight animation.
+            layouts.keys.forEach { layouts[$0]?.layout = DwindleTree.Layout() }
+        }
+        refresh()
     }
-
-    func updateConfiguration(_ configuration: TilingConfiguration) {
-        guard self.configuration != configuration else { return }
-        self.configuration = configuration
-        forceNextLayout = true
-        if enabled { tileVisibleApplications() }
+    func updateBarConfiguration(_ value: BarConfiguration) {
+        guard bar != value else { return }
+        bar = value; cancelAnimations(); refresh()
     }
+    func updateActiveDesktop(_ value: Int) { fallbackDesktop = max(1, value); spaceChanged() }
+    func shutdown() { setEnabled(false) }
+    func openAccessibilitySettings() { WorkspaceController.requestAccessibility() }
 
     func refresh() {
         guard enabled else { return }
-        tileVisibleApplications()
-    }
-
-    func updateActiveDesktop(_ desktop: Int) {
-        let desktop = max(1, desktop)
-        guard activeDesktop != desktop else { return }
-        activeDesktop = desktop
-        forceNextLayout = true
-        expectedFrames.removeAll()
-        pointerWasDown = false
-        pointerInteractionActive = false
-        pointerBaseline.removeAll()
-        if enabled { tileVisibleApplications() }
-    }
-
-    func shutdown() {
-        guard enabled else { return }
-        restoreManagedWindows(animated: false)
-        timer?.invalidate(); timer = nil
-        animationTimer?.invalidate(); animationTimer = nil
-        animations.removeAll()
-        expectedFrames.removeAll(); splitRatios.removeAll(); zoomSuspendedWindowIDs.removeAll(); zoomSuspendedAt.removeAll(); pendingNativeZoomWindowID = nil; pointerWasDown = false; pointerInteractionActive = false; pointerBaseline.removeAll()
-        enabled = false
-    }
-
-    func openAccessibilitySettings() {
-        WorkspaceController.requestAccessibility()
-    }
-
-    private func startTimer() {
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.tileVisibleApplications() }
-    }
-
-    private func tileVisibleApplications() {
-        guard enabled else { return }
-        guard AXIsProcessTrusted() else {
-            managedApplicationCount = 0
-            status = "Accessibility permission needed"
-            return
-        }
-
-        let windows = visibleApplicationWindows()
-        let signature = windows
-            .map { "\($0.id):\(displayID(for: $0.screen))" }
-            .sorted()
-        if !forceNextLayout, signature != appliedLayoutSignature {
-            if signature == pendingLayoutSignature {
-                pendingLayoutObservations += 1
-            } else {
-                pendingLayoutSignature = signature
-                pendingLayoutObservations = 1
-            }
-            // Ignore one-off CGWindowList omissions and transient windows. A
-            // membership/display change must survive two consecutive polls.
-            guard pendingLayoutObservations >= 2 else { return }
-        }
-        forceNextLayout = false
-        appliedLayoutSignature = signature
-        pendingLayoutSignature = []
-        pendingLayoutObservations = 0
-
-        let interactionGroups = Dictionary(grouping: windows, by: { displayID(for: $0.screen) })
-
-        // While the pointer is down, let the native window edge or title bar
-        // track the pointer without Ryft fighting AppKit. On release, translate
-        // the gesture into either a divider ratio or a slot swap.
+        defer { writeTrace() }
+        guard AXIsProcessTrusted() else { status = "Accessibility permission needed"; managedApplicationCount = 0; cancelAnimations(); return }
+        let now = CACurrentMediaTime()
+        guard now >= settleUntil, let snapshot = bridge.snapshot(excluding: configuration.excludedBundleIdentifiers) else { return }
+        contexts = spaces.current(fallbackDesktop: fallbackDesktop)
+        observed = snapshot.windows
+        pruneClosedWindows(snapshot.existing)
+        let groups = Dictionary(uniqueKeysWithValues: contexts.filter { !$0.nativeFullscreen }.map { context in
+            (context.key, observed.filter { belongs($0, to: context) })
+        })
+        let signature = contexts.map { "\($0.key.display):\($0.key.space):\($0.nativeFullscreen)" }.sorted().joined(separator: ",")
+            + groups.keys.sorted(by: { $0.display < $1.display }).map { key in
+                (groups[key] ?? []).map { "\($0.id):\($0.minimized):\($0.hidden):\($0.fullscreen)" }.sorted().joined(separator: ",")
+            }.joined(separator: ";")
+        if signature != pendingSignature { pendingSignature = signature; stableObservations = 1; cancelAnimations(); return }
+        stableObservations += 1
+        guard stableObservations >= 2 else { return }
         let pointerDown = NSEvent.pressedMouseButtons & 1 != 0
-        let suspendedBeforeGestureEnd = zoomSuspendedWindowIDs
-        if !pointerDown { updateZoomSuspensions(windows) }
-        let newlyZoomed = !zoomSuspendedWindowIDs.subtracting(suspendedBeforeGestureEnd).isEmpty
-        if pointerDown {
-            if !pointerWasDown {
-                pointerWasDown = true
-                animationTimer?.invalidate(); animationTimer = nil
-                animations.removeAll()
-                pointerBaseline = Dictionary(uniqueKeysWithValues: windows.map { ($0.id, $0.frame) })
-            } else if windows.contains(where: { window in
-                pointerBaseline[window.id].map { frameDifference(window.frame, $0) > 3 } ?? false
+        guard !pointerDown else { cancelAnimations(); return }
+        let focused = bridge.focusedWindowID(in: observed)
+        let cursor = CGEvent(source: nil)?.location
+        var count = 0, maximized = 0, floated = 0
+
+        for context in contexts where !context.nativeFullscreen {
+            let windows = (groups[context.key] ?? []).sorted { $0.id < $1.id }
+            let visible = windows.filter { !$0.minimized && !$0.hidden && !$0.fullscreen && $0.onScreen }
+            let area = DisplayLayoutMetrics.workArea(for: context.screen, bar: bar, outerGap: configuration.outerGap)
+            var state = layouts[context.key] ?? WorkspaceLayout()
+            for window in windows where !window.fullscreen {
+                if let oldKey = assignments[window.id], oldKey != context.key { layouts[oldKey]?.tree.remove(window.id) }
+                assignments[window.id] = context.key
+                if !state.tree.windows.contains(window.id) {
+                    if originals[window.id] == nil { originals[window.id] = Original(frame: window.frame, element: window.element) }
+                    if minimums[window.id] == nil { minimums[window.id] = CGSize(width: 120, height: 80) }
+                    let anchor = configuration.useActiveForSplits ? (state.focused ?? focused.flatMap { $0 != window.id ? $0 : nil }) : nil
+                    state.tree.insert(window.id, nextTo: anchor, in: area, cursor: cursor, options: treeOptions)
+                    // In a startup batch, open successive windows against the
+                    // last inserted leaf, not CGWindow's unpredictable Z-order.
+                    state.focused = window.id
+                }
+            }
+            if let focused, state.tree.windows.contains(focused) { state.focused = focused }
+            var active = Set(visible.map(\.id))
+            func makeLayout() -> DwindleTree.Layout {
+                configuration.mode == .dwindle
+                    ? state.tree.layout(in: area, active: active, gap: configuration.gap, scale: context.screen.backingScaleFactor, options: treeOptions, minimums: minimums)
+                    : DwindleTree.balanced(ids: state.tree.windows.filter { active.contains($0) }, in: area, gap: configuration.gap, scale: context.screen.backingScaleFactor)
+            }
+            var layout = makeLayout()
+            // Honor application minimum sizes. If they physically cannot fit,
+            // leave that window floating rather than overlapping its neighbors
+            // or issuing the same rejected AX size every animation frame.
+            while let id = state.tree.windows.reversed().first(where: { id in
+                guard let frame = layout.frames[id], let minimum = minimums[id] else { return false }
+                return frame.width + 2 < minimum.width || frame.height + 2 < minimum.height
             }) {
-                pointerInteractionActive = true
+                active.remove(id); floated += 1; layout = makeLayout()
             }
-            // Pausing corrective writes during a left-button gesture keeps
-            // native edge and title-bar tracking smooth and race-free.
-            return
-        } else if pointerWasDown {
-            pointerWasDown = false
-            pointerBaseline.removeAll()
-            if pointerInteractionActive {
-                pointerInteractionActive = false
-                if !newlyZoomed && configuration.mode == .dwindle { absorbPointerInteraction(windows: windows, grouped: interactionGroups) }
+            finishGesture(in: context, windows: visible, state: &state, layout: &layout, now: now)
+            let animate = state.area != area || state.layout.frames != layout.frames
+            state.layout = layout; state.area = area
+            layouts[context.key] = state
+            var decisions: [CGWindowID: WindowPresentation.Decision] = [:]
+            for window in visible {
+                var presentation = presentations[window.id] ?? WindowPresentation()
+                decisions[window.id] = presentation.observe(frame: window.frame, nativeFullscreen: window.fullscreen, now: now, pointerDown: false)
+                presentations[window.id] = presentation
             }
-        }
-
-        // Keep maximized windows in their existing layout slots. Their frames
-        // are skipped below, while every other window continues receiving its
-        // normal target. This avoids both layout collapse and a stale maximize
-        // state disabling the entire tiler.
-        let grouped = Dictionary(grouping: windows, by: { displayID(for: $0.screen) })
-
-        var tiledIDs = Set<CGWindowID>()
-        var tiledApplicationCount = 0
-        var nextExpectedFrames: [CGWindowID: CGRect] = [:]
-
-        for (display, displayWindows) in grouped {
-            let ordered = displayWindows.sorted { order(for: $0.id) < order(for: $1.id) }
-            guard let screen = ordered.first?.screen else { continue }
-
-            tiledApplicationCount += ordered.count
-            let frame = availableFrame(for: screen)
-            let frames: [CGRect]
-            if configuration.mode == .dwindle {
-                let ratios = ratios(for: LayoutKey(display: display, desktop: activeDesktop), count: ordered.count)
-                frames = dwindleLayout(count: ordered.count, in: frame, ratios: ratios).frames
-            } else {
-                frames = balancedLayout(count: ordered.count, in: frame)
-            }
-            for (window, target) in zip(ordered, frames) {
-                if originalWindows[window.id] == nil { originalWindows[window.id] = OriginalWindow(frame: window.frame, element: window.element) }
-                nextExpectedFrames[window.id] = target
-                tiledIDs.insert(window.id)
-                if !zoomSuspendedWindowIDs.contains(window.id) {
-                    setFrame(target, for: window.element, id: window.id)
+            // A native maximized window keeps its tree slot, but cannot block
+            // corrections or newly opened windows, even on the same desktop.
+            // macOS has no compositor-level mechanism to hide sibling tiles.
+            for window in visible {
+                guard let target = layout.frames[window.id], let decision = decisions[window.id] else { continue }
+                count += 1
+                switch decision {
+                case .maximize:
+                    maximized += 1
+                    setFrame(area, window: window, key: context.key, animated: false, now: now)
+                case .restoreTile:
+                    // Explicit tile restoration precedes any corrective poll;
+                    // no size-based heuristic can suspend it again.
+                    setFrame(target, window: window, key: context.key, animated: false, now: now, bypassBackoff: true)
+                case .tile:
+                    setFrame(target, window: window, key: context.key, animated: animate, now: now)
+                case .waitForNative, .nativeFullscreen: break
                 }
             }
         }
-
-        // A window that was tiled and is now the only application on its
-        // visible display returns to the frame it had before Ryft touched it.
-        for window in windows where originalWindows[window.id] != nil && !tiledIDs.contains(window.id) && !zoomSuspendedWindowIDs.contains(window.id) { restore([window]) }
-        let existingIDs = allWindowIDs()
-        originalWindows = originalWindows.filter { existingIDs.contains($0.key) }
-        windowOrder = windowOrder.filter { existingIDs.contains($0.key) }
-        zoomSuspendedWindowIDs.formIntersection(existingIDs)
-        expectedFrames = nextExpectedFrames
-
-        managedApplicationCount = tiledApplicationCount
-        let suspended = zoomSuspendedWindowIDs.count
-        switch (tiledApplicationCount, suspended) {
-        case (0, _): status = "Waiting for an application"
-        case (1, 0): status = "Filling the display with 1 window"
-        case (let count, 0): status = "Tiling \(count) windows"
-        case (let count, let maximized): status = "Tiling \(count) windows · \(maximized) maximized"
+        managedApplicationCount = count
+        if count == 0 { status = contexts.contains(where: \.nativeFullscreen) ? "Native fullscreen, tiling resumes on return" : "Waiting for an application" }
+        else {
+            status = configuration.mode == .dwindle ? "Dwindle · \(count) window\(count == 1 ? "" : "s")" : "Sizing & positioning · \(count) window\(count == 1 ? "" : "s")"
+            if maximized > 0 { status += " · \(maximized) maximized" }
+            if floated > 0 { status += " · \(floated) minimum-size exception" }
         }
     }
 
-    private func updateZoomSuspensions(_ windows: [ManagedWindow]) {
+    private func writeTrace() {
+        guard let traceURL else { return }
+        func rectangle(_ r: CGRect) -> [Double] { [r.minX, r.minY, r.width, r.height] }
+        let rows: [[String: Any]] = observed.map { window in
+            var row: [String: Any] = ["id": window.id, "bundle": NSRunningApplication(processIdentifier: window.pid)?.bundleIdentifier ?? "", "actual": rectangle(window.frame), "fullscreen": window.fullscreen, "minimized": window.minimized, "onScreen": window.onScreen]
+            if let key = assignments[window.id], let state = layouts[key] {
+                row["space"] = key.space; row["display"] = key.display; row["area"] = rectangle(state.area)
+                if let tile = state.layout.frames[window.id] { row["tile"] = rectangle(tile) }
+            }
+            return row
+        }
+        let value: [String: Any] = ["status": status, "enabled": enabled, "trusted": AXIsProcessTrusted(), "pointerDown": NSEvent.pressedMouseButtons & 1 != 0, "stableObservations": stableObservations, "settleRemaining": max(0, settleUntil - CACurrentMediaTime()), "windows": rows]
+        if let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .prettyPrinted]) { try? data.write(to: traceURL, options: .atomic) }
+    }
+
+    private var treeOptions: DwindleTree.Options {
+        var options = DwindleTree.Options()
+        options.preserveSplit = configuration.preserveSplit
+        options.widthMultiplier = configuration.splitWidthMultiplier
+        options.defaultRatio = configuration.defaultSplitRatio
+        switch configuration.newWindowPlacement {
+        case .cursor: options.placement = .cursor
+        case .before: options.placement = .before
+        case .after: options.placement = .after
+        }
+        return options
+    }
+    private func belongs(_ window: TilingWindowObservation, to context: TilingDisplayContext) -> Bool {
+        if let ids = context.windowIDs, !ids.contains(window.id) { return false }
+        if context.windowIDs == nil && !window.onScreen { return false }
+        let best = NSScreen.screens.max { a, b in
+            func score(_ screen: NSScreen) -> CGFloat {
+                let r = window.frame.intersection(DisplayLayoutMetrics.quartzFrame(screen.frame))
+                return r.isNull ? 0 : r.width * r.height
+            }
+            return score(a) < score(b)
+        }
+        return best.map { DisplayLayoutMetrics.displayID(for: $0) == context.key.display } ?? false
+    }
+    private func spaceChanged() {
+        cancelAnimations(); gesture = nil; lastTitleDown = nil
+        pendingSignature = ""; stableObservations = 0
+        settleUntil = CACurrentMediaTime() + 0.20
+    }
+    private func pruneClosedWindows(_ existing: Set<CGWindowID>) {
+        for key in Array(layouts.keys) {
+            for id in layouts[key]?.tree.windows ?? [] where !existing.contains(id) { layouts[key]?.tree.remove(id) }
+        }
+        originals = originals.filter { existing.contains($0.key) }
+        assignments = assignments.filter { existing.contains($0.key) }
+        presentations = presentations.filter { existing.contains($0.key) }
+        minimums = minimums.filter { existing.contains($0.key) }
+        nativeTiles.retain(existing)
+        writeBackoff = writeBackoff.filter { existing.contains($0.key) }
+    }
+
+    private func pointerEvent(_ event: NSEvent) {
+        guard enabled, let point = event.cgEvent?.location else { return }
         let now = CACurrentMediaTime()
-        if now - pendingNativeZoomAt > 1.4 { pendingNativeZoomWindowID = nil }
-        for window in windows {
-            let available = availableFrame(for: window.screen)
-            let coversDisplay = window.frame.width >= available.width * 0.88
-                && window.frame.height >= available.height * 0.88
-                && abs(window.frame.midX - available.midX) <= 36
-                && abs(window.frame.midY - available.midY) <= 36
-            if zoomSuspendedWindowIDs.contains(window.id) {
-                // macOS owns the maximized frame. A second native title-bar
-                // double-click restores it; only then does tiling resume.
-                if !coversDisplay, now - (zoomSuspendedAt[window.id] ?? 0) > 0.75 {
-                    zoomSuspendedWindowIDs.remove(window.id)
-                    zoomSuspendedAt.removeValue(forKey: window.id)
-                }
-            } else if let expected = expectedFrames[window.id], coversDisplay,
-                      frameDifference(window.frame, expected) > 40 {
-                // Fallback for systems where the global mouse monitor is not
-                // delivered: observe macOS's completed zoom frame before this
-                // layout pass can overwrite it.
-                animationTimer?.invalidate(); animationTimer = nil
-                animations.removeValue(forKey: window.id)
-                zoomSuspendedWindowIDs.insert(window.id)
-                zoomSuspendedAt[window.id] = now
-                pendingNativeZoomWindowID = nil
-            }
-        }
-    }
-
-    private func recordNativeTitleBarDoubleClick(at point: CGPoint) {
-        guard enabled,
-              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[CFString: Any]] else { return }
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        for info in list {
-            guard let pid = (info[kCGWindowOwnerPID] as? NSNumber)?.int32Value,
-                  pid != ownPID,
-                  (info[kCGWindowLayer] as? NSNumber)?.intValue == 0,
-                  let bounds = info[kCGWindowBounds] as? NSDictionary,
-                  let frame = CGRect(dictionaryRepresentation: bounds),
-                  frame.contains(point),
-                  let number = info[kCGWindowNumber] as? NSNumber else { continue }
-            // Browser chrome can include a tab strip, toolbar and profile row;
-            // keep the hit region broad enough for Safari/Chrome/Arc while
-            // remaining confined to the top of the window.
-            let titleHeight = min(104, max(36, frame.height * 0.12))
-            // CGWindow and CGEvent both use Quartz's top-left display space.
-            // Restrict this to title/tab chrome so page double-clicks never
-            // suspend a browser from tiling.
-            guard point.y <= frame.minY + titleHeight else { continue }
-            let id = CGWindowID(number.uint32Value)
-            pendingNativeZoomWindowID = id
-            pendingNativeZoomAt = CACurrentMediaTime()
-            if !zoomSuspendedWindowIDs.contains(id) {
-                // Suspend immediately, before macOS finishes its zoom
-                // animation, so the 250 ms layout pass cannot snap it back.
-                zoomSuspendedWindowIDs.insert(id)
-                zoomSuspendedAt[id] = CACurrentMediaTime()
-                animationTimer?.invalidate(); animationTimer = nil
-                animations.removeValue(forKey: id)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in self?.fillDisplayAfterNativeZoom(id) }
-            } else {
-                // The second native double-click means restore. Resume the
-                // existing Dwindle slot even if an app does not restore its
-                // pre-zoom frame consistently.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [weak self] in
-                    guard let self else { return }
-                    // AX frame writes used to normalize browser zoom can erase
-                    // AppKit's private restore frame. Restore the exact Dwindle
-                    // slot ourselves before reenabling correction, otherwise
-                    // fallback maximize detection can immediately suspend it
-                    // again while it is still full-sized.
-                    if let target = self.expectedFrames[id],
-                       let window = self.visibleApplicationWindows().first(where: { $0.id == id }) {
-                        self.animations.removeValue(forKey: id)
-                        self.applyFrame(target, to: window.element)
-                    }
-                    self.zoomSuspendedWindowIDs.remove(id)
-                    self.zoomSuspendedAt.removeValue(forKey: id)
-                    self.pendingNativeZoomWindowID = nil
-                    self.forceNextLayout = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.tileVisibleApplications() }
+        switch event.type {
+        case .leftMouseDown:
+            cancelAnimations()
+            guard let window = hitWindow(at: point), let key = assignments[window.id], let actual = bridge.frame(window.element) else { gesture = nil; return }
+            let edge = min(abs(point.x - actual.minX), abs(point.x - actual.maxX), abs(point.y - actual.minY), abs(point.y - actual.maxY)) <= 7
+            let title = isTitleChrome(window: window, frame: actual, at: point)
+            gesture = Gesture(id: window.id, key: key, kind: edge ? .edge : title ? .title : .content, point: point, frame: actual)
+            if event.clickCount == 1 && title {
+                lastTitleDown = (window.id, actual, now)
+                if presentations[window.id]?.isNormal != false, let tile = layouts[key]?.layout.frames[window.id] {
+                    nativeTiles.record(window.id, requested: tile, actual: actual, tolerance: 1.05)
                 }
             }
-            return
-        }
-    }
-
-    private func fillDisplayAfterNativeZoom(_ id: CGWindowID) {
-        guard enabled, zoomSuspendedWindowIDs.contains(id),
-              let window = visibleApplicationWindows().first(where: { $0.id == id }) else { return }
-        let available = availableFrame(for: window.screen)
-        // Native title-bar zoom varies by application (Safari and Chrome may
-        // choose an "ideal" content size). Ryft preserves the native action but
-        // normalizes the result to the same safe full-display frame used when
-        // a desktop contains one tiled window.
-        if frameDifference(window.frame, available) > 3 { setFrame(available, for: window.element, id: id) }
-    }
-
-    private func allWindowIDs() -> Set<CGWindowID> {
-        guard let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[CFString: Any]] else { return [] }
-        return Set(list.compactMap { ($0[kCGWindowNumber] as? NSNumber).map { CGWindowID($0.uint32Value) } })
-    }
-
-    private func visibleApplicationWindows() -> [ManagedWindow] {
-        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        guard let rawList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[CFString: Any]] else { return [] }
-        // Keep managing the same window when an application temporarily raises
-        // another standard panel or reorders its CG window list.
-        let list = rawList.enumerated().sorted { lhs, rhs in
-            let lhsID = (lhs.element[kCGWindowNumber] as? NSNumber).map { CGWindowID($0.uint32Value) }
-            let rhsID = (rhs.element[kCGWindowNumber] as? NSNumber).map { CGWindowID($0.uint32Value) }
-            let lhsKnown = lhsID.map { windowOrder[$0] != nil } ?? false
-            let rhsKnown = rhsID.map { windowOrder[$0] != nil } ?? false
-            return lhsKnown == rhsKnown ? lhs.offset < rhs.offset : lhsKnown
-        }.map(\.element)
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        var result: [ManagedWindow] = []
-        var accessibleByPID: [pid_t: [(element: AXUIElement, frame: CGRect)]] = [:]
-        var usedAccessibleIndices: [pid_t: Set<Int>] = [:]
-
-        for info in list {
-            guard let pidNumber = info[kCGWindowOwnerPID] as? NSNumber,
-                  let layer = info[kCGWindowLayer] as? NSNumber,
-                  let boundsDictionary = info[kCGWindowBounds] as? NSDictionary,
-                  let cgFrame = CGRect(dictionaryRepresentation: boundsDictionary),
-                  let windowNumber = info[kCGWindowNumber] as? NSNumber else { continue }
-            let pid = pidNumber.int32Value
-            guard pid != ownPID, layer.intValue == 0, cgFrame.width >= 180, cgFrame.height >= 100 else { continue }
-            if let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier, configuration.excludedBundleIdentifiers.contains(bundleID) { continue }
-            let candidates: [(element: AXUIElement, frame: CGRect)]
-            if let cached = accessibleByPID[pid] { candidates = cached }
-            else {
-                let loaded = accessibleWindows(for: pid)
-                accessibleByPID[pid] = loaded
-                candidates = loaded
+            if event.clickCount == 2 && title {
+                // A global callback can arrive after the second click has
+                // already triggered native zoom. Use the first click's frame.
+                let first = lastTitleDown.flatMap { $0.id == window.id && now - $0.at <= NSEvent.doubleClickInterval + 0.15 ? $0.frame : nil } ?? window.frame
+                var mode = presentations[window.id] ?? WindowPresentation()
+                mode.titleBarDoubleClick(frame: first, now: now)
+                presentations[window.id] = mode
+                gesture = nil; lastTitleDown = nil
             }
-            let used = usedAccessibleIndices[pid] ?? []
-            guard let matchIndex = candidates.indices.filter({ !used.contains($0) }).min(by: {
-                frameDistance(candidates[$0].frame, cgFrame) < frameDistance(candidates[$1].frame, cgFrame)
-            }), let screen = screen(containing: cgFrame) else { continue }
-            usedAccessibleIndices[pid, default: []].insert(matchIndex)
-            let match = candidates[matchIndex]
-            result.append(ManagedWindow(id: CGWindowID(windowNumber.uint32Value), pid: pid, element: match.element, frame: match.frame, screen: screen))
-        }
-        return result
-    }
-
-    private func accessibleWindows(for pid: pid_t) -> [(element: AXUIElement, frame: CGRect)] {
-        let application = AXUIElementCreateApplication(pid)
-        guard let windows: [AXUIElement] = attribute(application, kAXWindowsAttribute as CFString) else { return [] }
-        return windows.compactMap { window in
-            guard (attribute(window, kAXRoleAttribute as CFString) as String?) == (kAXWindowRole as String),
-                  (attribute(window, kAXSubroleAttribute as CFString) as String?) == (kAXStandardWindowSubrole as String),
-                  attribute(window, kAXMinimizedAttribute as CFString) as Bool? != true,
-                  attribute(window, "AXFullScreen" as CFString) as Bool? != true,
-                  isSettable(kAXPositionAttribute as CFString, on: window),
-                  isSettable(kAXSizeAttribute as CFString, on: window),
-                  let frame = frame(of: window) else { return nil }
-            return (window, frame)
+        case .leftMouseDragged:
+            if let start = gesture?.point, hypot(point.x - start.x, point.y - start.y) > 5 { gesture?.dragged = true }
+        case .leftMouseUp: gesture?.releasedAt = now
+        default: break
         }
     }
-
-    private func frameDistance(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
-        abs(lhs.minX - rhs.minX) + abs(lhs.minY - rhs.minY) + abs(lhs.width - rhs.width) + abs(lhs.height - rhs.height)
+    private func hitWindow(at point: CGPoint) -> TilingWindowObservation? {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[CFString: Any]] else { return nil }
+        for entry in list where (entry[kCGWindowLayer] as? NSNumber)?.intValue == 0 {
+            guard let dictionary = entry[kCGWindowBounds] as? NSDictionary, let frame = CGRect(dictionaryRepresentation: dictionary), frame.contains(point),
+                  let id = (entry[kCGWindowNumber] as? NSNumber)?.uint32Value else { continue }
+            // The first hit is the actual foreground window. Never fall through
+            // to a tiled window underneath an excluded application or dialog.
+            return observed.first { $0.id == id && !$0.fullscreen && !$0.minimized }
+        }
+        return nil
     }
-
-    private func isSettable(_ attribute: CFString, on element: AXUIElement) -> Bool {
-        var settable = DarwinBoolean(false)
-        return AXUIElementIsAttributeSettable(element, attribute, &settable) == .success && settable.boolValue
+    private func isTitleChrome(window: TilingWindowObservation, frame: CGRect, at point: CGPoint) -> Bool {
+        guard point.y >= frame.minY, point.y <= frame.minY + 104 else { return false }
+        var hit: AXUIElement?
+        let app = AXUIElementCreateApplication(window.pid)
+        var toolbar = false
+        if AXUIElementCopyElementAtPosition(app, Float(point.x), Float(point.y), &hit) == .success {
+            for _ in 0..<8 {
+                guard let element = hit else { break }
+                let role: String = bridge.attribute(element, kAXRoleAttribute as CFString) ?? ""
+                if ["AXButton", "AXRadioButton", "AXTextField", "AXSearchField", "AXPopUpButton", "AXLink", "AXTextArea", "AXWebArea"].contains(role) { return false }
+                if role == "AXToolbar" { toolbar = true }
+                if role == "AXWindow" { break }
+                hit = bridge.attribute(element, kAXParentAttribute as CFString)
+            }
+        }
+        return toolbar || point.y <= frame.minY + 36
     }
-
-    private func frame(of element: AXUIElement) -> CGRect? {
-        guard let positionValue: AXValue = attribute(element, kAXPositionAttribute as CFString),
-              let sizeValue: AXValue = attribute(element, kAXSizeAttribute as CFString) else { return nil }
-        var point = CGPoint.zero; var size = CGSize.zero
-        guard AXValueGetValue(positionValue, .cgPoint, &point), AXValueGetValue(sizeValue, .cgSize, &size) else { return nil }
-        return CGRect(origin: point, size: size)
-    }
-
-    private func attribute<T>(_ element: AXUIElement, _ name: CFString) -> T? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
-        return value as? T
-    }
-
-    private func setFrame(_ target: CGRect, for element: AXUIElement, id: CGWindowID, animated: Bool = true) {
-        if animated, let animation = animations[id], frameDifference(animation.to, target) < 1 { return }
-        guard let current = frame(of: element), frameDifference(current, target) > 1 else {
-            animations.removeValue(forKey: id)
+    private func finishGesture(in context: TilingDisplayContext, windows: [TilingWindowObservation], state: inout WorkspaceLayout, layout: inout DwindleTree.Layout, now: CFTimeInterval) {
+        guard let gesture, gesture.key == context.key, let released = gesture.releasedAt, now - released >= 0.08 else { return }
+        self.gesture = nil
+        guard gesture.dragged, let window = windows.first(where: { $0.id == gesture.id }) else { return }
+        if presentations[window.id]?.isNormal == false {
+            if gesture.kind != .content { presentations[window.id]?.restore(now: now) }
             return
         }
-        guard animated, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
-            animations.removeValue(forKey: id)
-            applyFrame(target, to: element)
+        guard configuration.mode == .dwindle else { return }
+        switch gesture.kind {
+        case .edge:
+            guard abs(gesture.frame.width - window.frame.width) > 3 || abs(gesture.frame.height - window.frame.height) > 3 else { return }
+            state.tree.resize(window.id, from: gesture.frame, to: window.frame, layout: state.layout)
+        case .title:
+            let point = CGPoint(x: window.frame.midX, y: window.frame.midY)
+            if let other = state.layout.frames.keys.sorted().first(where: { $0 != window.id && state.layout.frames[$0]?.contains(point) == true }) { state.tree.swap(window.id, other) }
+        case .content: return
+        }
+        layout = state.tree.layout(in: DisplayLayoutMetrics.workArea(for: context.screen, bar: bar, outerGap: configuration.outerGap), active: Set(windows.map(\.id)), gap: configuration.gap, scale: context.screen.backingScaleFactor, options: treeOptions, minimums: minimums)
+    }
+
+    private func setFrame(_ requested: CGRect, window: TilingWindowObservation, key: TilingLayoutKey, animated: Bool, now: CFTimeInterval, bypassBackoff: Bool = false) {
+        guard bypassBackoff || now >= (writeBackoff[window.id] ?? 0) else { return }
+        let normal = presentations[window.id]?.isNormal != false
+        let target = normal ? nativeTiles.resolve(window.id, requested: requested) : requested
+        if let animation = animations[window.id], bridge.difference(animation.to, target) < 0.5 { return }
+        guard let current = bridge.frame(window.element) else { return }
+        guard bridge.difference(current, target) > 0.55 else {
+            animations.removeValue(forKey: window.id)
+            if normal { nativeTiles.record(window.id, requested: requested, actual: current) }
             return
         }
-        animations[id] = FrameAnimation(element: element, from: current, to: target.integral, startedAt: CACurrentMediaTime(), duration: 0.20)
-        startAnimationTimerIfNeeded()
+        if animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion && presentations[window.id]?.isNormal != false {
+            animations[window.id] = Animation(window: window, key: key, from: current, to: target, requested: requested, start: now)
+            if animationTimer == nil {
+                let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.advanceAnimations() }
+                RunLoop.main.add(timer, forMode: .common); animationTimer = timer
+            }
+        } else {
+            animations.removeValue(forKey: window.id)
+            if bridge.apply(target, to: window.element) { learnMinimumSize(window, target: requested) }
+            else { writeBackoff[window.id] = now + 1 }
+        }
     }
-
-    private func startAnimationTimerIfNeeded() {
-        guard animationTimer == nil else { return }
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.advanceAnimations() }
-        RunLoop.main.add(timer, forMode: .common)
-        animationTimer = timer
-    }
-
     private func advanceAnimations() {
+        guard enabled, NSEvent.pressedMouseButtons & 1 == 0, CACurrentMediaTime() >= settleUntil else { cancelAnimations(); return }
+        let active = Set(spaces.current(fallbackDesktop: fallbackDesktop).filter { !$0.nativeFullscreen }.map(\.key))
         let now = CACurrentMediaTime()
-        var completed: [CGWindowID] = []
         for (id, animation) in animations {
-            let progress = min(1, max(0, (now - animation.startedAt) / animation.duration))
-            let eased = 1 - pow(1 - progress, 5) // decisive ease-out-quint
-            let frame = interpolate(from: animation.from, to: animation.to, progress: CGFloat(eased))
-            applyFrame(frame, to: animation.element)
-            if progress >= 1 { completed.append(id) }
+            guard active.contains(animation.key), assignments[id] == animation.key, presentations[id]?.isNormal != false else { animations.removeValue(forKey: id); continue }
+            let progress = min(1, (now - animation.start) / 0.16)
+            let t = CGFloat(1 - pow(1 - progress, 4))
+            let a = animation.from, b = animation.to
+            let frame = CGRect(x: a.minX + (b.minX - a.minX) * t, y: a.minY + (b.minY - a.minY) * t, width: a.width + (b.width - a.width) * t, height: a.height + (b.height - a.height) * t)
+            if !bridge.apply(frame, to: animation.window.element) { animations.removeValue(forKey: id); writeBackoff[id] = now + 1 }
+            else if progress >= 1 { animations.removeValue(forKey: id); learnMinimumSize(animation.window, target: animation.requested) }
         }
-        for id in completed { animations.removeValue(forKey: id) }
         if animations.isEmpty { animationTimer?.invalidate(); animationTimer = nil }
     }
-
-    private func interpolate(from: CGRect, to: CGRect, progress: CGFloat) -> CGRect {
-        CGRect(
-            x: from.minX + (to.minX - from.minX) * progress,
-            y: from.minY + (to.minY - from.minY) * progress,
-            width: from.width + (to.width - from.width) * progress,
-            height: from.height + (to.height - from.height) * progress
-        )
+    private func learnMinimumSize(_ window: TilingWindowObservation, target: CGRect) {
+        guard let actual = bridge.frame(window.element) else { return }
+        if presentations[window.id]?.isNormal != false { nativeTiles.record(window.id, requested: target, actual: actual) }
+        var size = minimums[window.id] ?? CGSize(width: 1, height: 1)
+        if actual.width > target.width + 2 { size.width = max(size.width, actual.width) }
+        if actual.height > target.height + 2 { size.height = max(size.height, actual.height) }
+        minimums[window.id] = size
+        if bridge.difference(actual, target) > 2 { writeBackoff[window.id] = CACurrentMediaTime() + 0.5 }
     }
-
-    private func applyFrame(_ frame: CGRect, to element: AXUIElement) {
-        var point = frame.origin; var size = frame.size
-        guard let positionValue = AXValueCreate(.cgPoint, &point), let sizeValue = AXValueCreate(.cgSize, &size) else { return }
-        // Move before resizing so AppKit does not briefly grow the window from
-        // its old top edge. Reasserting position after size handles apps that
-        // apply minimum-size constraints without producing a visible jump.
-        AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
-        AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeValue)
-        AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
-    }
-
-    private func frameDifference(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
-        max(abs(lhs.minX - rhs.minX), abs(lhs.minY - rhs.minY), abs(lhs.width - rhs.width), abs(lhs.height - rhs.height))
-    }
-
-    private func restore(_ windows: [ManagedWindow]) {
-        for window in windows {
-            guard let original = originalWindows.removeValue(forKey: window.id) else { continue }
-            setFrame(original.frame, for: original.element, id: window.id)
+    private func cancelAnimations() { animationTimer?.invalidate(); animationTimer = nil; animations.removeAll() }
+    private func restoreVisibleOriginals() {
+        // Quitting must not move windows on other Spaces or native fullscreen.
+        guard AXIsProcessTrusted(), let snapshot = bridge.snapshot(excluding: configuration.excludedBundleIdentifiers) else { return }
+        let current = spaces.current(fallbackDesktop: fallbackDesktop)
+        for window in snapshot.windows where !window.minimized && !window.fullscreen && !window.hidden && window.onScreen {
+            guard current.contains(where: { !$0.nativeFullscreen && belongs(window, to: $0) }), let original = originals[window.id], presentations[window.id]?.isNormal != false else { continue }
+            _ = bridge.apply(original.frame, to: original.element)
         }
     }
-
-    private func restoreManagedWindows(animated: Bool) {
-        for (id, original) in originalWindows { setFrame(original.frame, for: original.element, id: id, animated: animated) }
-        originalWindows.removeAll()
-        windowOrder.removeAll()
-    }
-
-    private func order(for id: CGWindowID) -> Int {
-        if let order = windowOrder[id] { return order }
-        let order = nextOrder; nextOrder += 1; windowOrder[id] = order
-        return order
-    }
-
-    private func screen(containing frame: CGRect) -> NSScreen? {
-        // CG can briefly report a visible window just beyond an edge while a
-        // Space or application transition settles. Keep it assigned to the
-        // nearest display so the next layout frame clamps it safely on-screen.
-        NSScreen.screens.max { lhs, rhs in
-            screenScore(for: lhs, window: frame) < screenScore(for: rhs, window: frame)
-        }
-    }
-
-    private func screenScore(for screen: NSScreen, window: CGRect) -> CGFloat {
-        let bounds = displayBounds(for: screen)
-        let overlap = intersectionArea(window, bounds)
-        if overlap > 0 { return 1_000_000_000 + overlap }
-        let dx = window.midX - bounds.midX
-        let dy = window.midY - bounds.midY
-        return -(dx * dx + dy * dy)
-    }
-
-    private func intersectionArea(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
-        let intersection = lhs.intersection(rhs)
-        return intersection.isNull ? 0 : intersection.width * intersection.height
-    }
-
-    private func displayID(for screen: NSScreen) -> CGDirectDisplayID {
-        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
-    }
-
-    private func displayBounds(for screen: NSScreen) -> CGRect {
-        CGDisplayBounds(displayID(for: screen))
-    }
-
-    private func availableFrame(for screen: NSScreen) -> CGRect {
-        let display = displayBounds(for: screen)
-        let mainMaxY = CGDisplayBounds(CGMainDisplayID()).maxY
-        // A hidden Dock can change visibleFrame whenever the pointer reaches
-        // its edge. Auto-hide must not continuously resize every tiled window.
-        let dockAutoHides = UserDefaults(suiteName: "com.apple.dock")?.bool(forKey: "autohide") ?? false
-        let visible = dockAutoHides ? screen.frame : screen.visibleFrame
-        let visibleTop = mainMaxY - visible.maxY
-        let visibleBottom = mainMaxY - visible.minY
-        var frame = CGRect(
-            x: max(display.minX, visible.minX),
-            y: max(display.minY, visibleTop),
-            width: min(display.maxX, visible.maxX) - max(display.minX, visible.minX),
-            height: min(display.maxY, visibleBottom) - max(display.minY, visibleTop)
-        )
-
-        let shouldReserveBar = bar.enabled && (bar.showOnAllDisplays || screen == NSScreen.main)
-        if shouldReserveBar && bar.position != .top {
-            // The native menu bar remains hidden, but Ryft keeps its exact
-            // wallpaper strip visible. Windows must begin where that strip ends.
-            let coverBottom = display.minY + DisplayLayoutMetrics.menuBarHeight(for: screen)
-            let removed = max(0, coverBottom - frame.minY)
-            frame.origin.y += removed; frame.size.height -= removed
-        }
-        if shouldReserveBar {
-            let insets = bar.presentation == .top ? 0 : bar.outerInset * 2
-            let shelf: CGFloat = bar.position == .top && bar.notchMaskEnabled
-                ? (bar.notchMaskHeight > 0 ? bar.notchMaskHeight : ((screen.auxiliaryTopLeftArea != nil || screen.auxiliaryTopRightArea != nil) ? max(screen.safeAreaInsets.top, 32) : 0))
-                : 0
-            let reserved = CGFloat(bar.height + insets) + shelf
-            switch bar.position {
-            case .top:
-                let edge = display.minY + reserved
-                let removed = max(0, edge - frame.minY)
-                frame.origin.y += removed; frame.size.height -= removed
-            case .bottom:
-                frame.size.height = max(0, min(frame.maxY, display.maxY - reserved) - frame.minY)
-            case .left:
-                let edge = display.minX + reserved
-                let removed = max(0, edge - frame.minX)
-                frame.origin.x += removed; frame.size.width -= removed
-            case .right:
-                frame.size.width = max(0, min(frame.maxX, display.maxX - reserved) - frame.minX)
-            }
-        }
-        let gap = max(0, min(configuration.outerGap, 40))
-        return frame.insetBy(dx: gap, dy: gap)
-    }
-
-    private func ratios(for key: LayoutKey, count: Int) -> [CGFloat] {
-        let needed = max(0, count - 1)
-        var values = splitRatios[key] ?? []
-        if values.count > needed { values.removeLast(values.count - needed) }
-        if values.count < needed { values.append(contentsOf: repeatElement(0.5, count: needed - values.count)) }
-        splitRatios[key] = values
-        return values
-    }
-
-    private func absorbPointerInteraction(
-        windows: [ManagedWindow],
-        grouped: [CGDirectDisplayID: [ManagedWindow]]
-    ) {
-        for (display, displayWindows) in grouped {
-            let ordered = displayWindows.sorted { order(for: $0.id) < order(for: $1.id) }
-            guard ordered.count > 1, let screen = ordered.first?.screen else { continue }
-            let available = availableFrame(for: screen)
-            let key = LayoutKey(display: display, desktop: activeDesktop)
-            var ratios = ratios(for: key, count: ordered.count)
-            let layout = dwindleLayout(count: ordered.count, in: available, ratios: ratios)
-            guard let changedIndex = ordered.indices.max(by: {
-                frameDifference(ordered[$0].frame, layout.frames[$0]) < frameDifference(ordered[$1].frame, layout.frames[$1])
-            }), frameDifference(ordered[changedIndex].frame, layout.frames[changedIndex]) > 5 else { continue }
-
-            let actual = ordered[changedIndex].frame
-            let expected = layout.frames[changedIndex]
-            let movedDistance = hypot(actual.midX - expected.midX, actual.midY - expected.midY)
-            let sizeDifference = max(abs(actual.width - expected.width), abs(actual.height - expected.height))
-
-            // A title-bar drag into another slot swaps the two applications.
-            // Reordering the stable slot indices means the following layout
-            // animates both windows simultaneously rather than chasing them.
-            if movedDistance > 24, sizeDifference < 40,
-               let destination = layout.frames.indices.first(where: { $0 != changedIndex && layout.frames[$0].contains(CGPoint(x: actual.midX, y: actual.midY)) }) {
-                let firstOrder = order(for: ordered[changedIndex].id)
-                let secondOrder = order(for: ordered[destination].id)
-                windowOrder[ordered[changedIndex].id] = secondOrder
-                windowOrder[ordered[destination].id] = firstOrder
-                status = "Swapped applications"
-                continue
-            }
-
-            // An edge drag changes the nearest Dwindle separator. Every window
-            // on the opposite side is resized from the same ratio, preserving
-            // gaps and preventing overlap even in deeper recursive layouts.
-            let gap = CGFloat(max(0, min(configuration.gap, 40)))
-            var best: (split: LayoutSplit, boundary: CGFloat, delta: CGFloat)?
-            for split in layout.splits where changedIndex >= split.index {
-                let oldEdge: CGFloat
-                let newEdge: CGFloat
-                switch split.axis {
-                case .horizontal:
-                    if changedIndex == split.index { oldEdge = expected.maxX; newEdge = actual.maxX }
-                    else { oldEdge = expected.minX - gap; newEdge = actual.minX - gap }
-                case .vertical:
-                    if changedIndex == split.index { oldEdge = expected.maxY; newEdge = actual.maxY }
-                    else { oldEdge = expected.minY - gap; newEdge = actual.minY - gap }
-                }
-                guard abs(oldEdge - split.boundary) <= 3 else { continue }
-                let delta = abs(newEdge - split.boundary)
-                if delta > (best?.delta ?? 5) { best = (split, newEdge, delta) }
-            }
-            guard let best else { continue }
-            let usable: CGFloat
-            let consumed: CGFloat
-            switch best.split.axis {
-            case .horizontal:
-                usable = best.split.container.width - gap
-                consumed = best.boundary - best.split.container.minX
-            case .vertical:
-                usable = best.split.container.height - gap
-                consumed = best.boundary - best.split.container.minY
-            }
-            guard usable > 1 else { continue }
-            ratios[best.split.index] = min(0.82, max(0.18, consumed / usable))
-            splitRatios[key] = ratios
-            status = "Adjusted tile split"
-        }
-    }
-
-    private func balancedLayout(count: Int, in frame: CGRect) -> [CGRect] {
-        guard count > 0 else { return [] }
-        guard count > 1 else { return [frame.integral] }
-        let columns = max(1, Int(ceil(sqrt(Double(count)))))
-        let rows = max(1, Int(ceil(Double(count) / Double(columns))))
-        let gap = CGFloat(max(0, min(configuration.gap, 40)))
-        let rowHeight = max(1, (frame.height - gap * CGFloat(rows - 1)) / CGFloat(rows))
-        var result: [CGRect] = []
-        var index = 0
-        for row in 0..<rows {
-            let remaining = count - index
-            let itemsInRow = min(columns, remaining)
-            let itemWidth = max(1, (frame.width - gap * CGFloat(itemsInRow - 1)) / CGFloat(itemsInRow))
-            for column in 0..<itemsInRow {
-                result.append(CGRect(
-                    x: frame.minX + CGFloat(column) * (itemWidth + gap),
-                    y: frame.minY + CGFloat(row) * (rowHeight + gap),
-                    width: itemWidth,
-                    height: rowHeight
-                ).integral)
-                index += 1
-            }
-        }
-        return result
-    }
-
-    private func dwindleLayout(count: Int, in frame: CGRect, ratios: [CGFloat]) -> (frames: [CGRect], splits: [LayoutSplit]) {
-        guard count > 1 else { return ([frame.integral], []) }
-        let gap = CGFloat(max(0, min(configuration.gap, 40)))
-        var frames: [CGRect] = []
-        var splits: [LayoutSplit] = []
-        var remainder = frame
-
-        for index in 0..<count {
-            let remaining = count - index
-            if remaining == 1 {
-                frames.append(remainder.integral)
-                break
-            }
-            let ratio = min(0.82, max(0.18, ratios.indices.contains(index) ? ratios[index] : 0.5))
-            if remainder.width >= remainder.height {
-                let firstWidth = floor((remainder.width - gap) * ratio)
-                let first = CGRect(x: remainder.minX, y: remainder.minY, width: firstWidth, height: remainder.height)
-                frames.append(first.integral)
-                splits.append(LayoutSplit(index: index, axis: .horizontal, container: remainder, boundary: first.maxX))
-                remainder = CGRect(x: first.maxX + gap, y: remainder.minY, width: remainder.width - firstWidth - gap, height: remainder.height)
-            } else {
-                let firstHeight = floor((remainder.height - gap) * ratio)
-                let first = CGRect(x: remainder.minX, y: remainder.minY, width: remainder.width, height: firstHeight)
-                frames.append(first.integral)
-                splits.append(LayoutSplit(index: index, axis: .vertical, container: remainder, boundary: first.maxY))
-                remainder = CGRect(x: remainder.minX, y: first.maxY + gap, width: remainder.width, height: remainder.height - firstHeight - gap)
-            }
-        }
-        return (frames, splits)
+    private func reset() {
+        layouts.removeAll(); assignments.removeAll(); originals.removeAll(); presentations.removeAll()
+        minimums.removeAll(); nativeTiles = NativeTileMemory(); writeBackoff.removeAll(); observed.removeAll(); contexts.removeAll(); gesture = nil; lastTitleDown = nil
     }
 }

@@ -6,8 +6,11 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [.executable(name: "Ryft", targets: ["Ryft"])],
     targets: [
+        .target(name: "RyftWindowLayout"),
+        .testTarget(name: "RyftWindowLayoutTests", dependencies: ["RyftWindowLayout"]),
         .executableTarget(
             name: "Ryft",
+            dependencies: ["RyftWindowLayout"],
             resources: [.process("Resources")],
             linkerSettings: [
                 .linkedFramework("AppKit"),

@@ -24,16 +24,12 @@ final class BarPanelController {
         let panel: NSPanel
         let context: PanelContext
         let cornerPanels: [NSPanel]
-        let menuBarCoverPanel: NSPanel
     }
 
     private let model: AppModel
     private let spaceCoverManager = SpaceMenuBarCoverManager()
     private var entries: [PanelEntry] = []
     private var cancellables = Set<AnyCancellable>()
-    private var coversWaitingForWallpaper = Set<ObjectIdentifier>()
-    private var coverWallpaperBeforeSpaceChange: [NSNumber: String] = [:]
-    private var spaceChangeGeneration = UUID()
 
     init(model: AppModel) {
         self.model = model
@@ -45,7 +41,10 @@ final class BarPanelController {
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.activeSpaceDidChangeNotification)
             .sink { [weak self] _ in
                 guard let self else { return }
-                self.spaceCoverManager.synchronize(config: self.model.configuration.bar, screens: NSScreen.screens)
+                self.synchronize(self.model.configuration.bar)
+                for delay in [0.016, 0.06, 0.20] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.refreshWallpaperPaths() }
+                }
             }.store(in: &cancellables)
         Timer.publish(every: 1, on: .main, in: .common).autoconnect()
             .sink { [weak self] _ in self?.refreshWallpaperPaths() }.store(in: &cancellables)
@@ -55,16 +54,17 @@ final class BarPanelController {
     private func synchronize(_ optionalConfig: BarConfiguration?) {
         guard let config = optionalConfig else { return }
         guard config.enabled else {
-            entries.forEach { $0.panel.orderOut(nil); $0.cornerPanels.forEach { $0.orderOut(nil) }; $0.menuBarCoverPanel.orderOut(nil) }
+            spaceCoverManager.synchronize(config: config, screens: [])
+            entries.forEach { $0.panel.orderOut(nil); $0.cornerPanels.forEach { $0.orderOut(nil) } }
             entries.removeAll()
             return
         }
 
-        let desiredScreens = config.showOnAllDisplays ? NSScreen.screens : [NSScreen.main].compactMap { $0 }
+        let desiredScreens = config.showOnAllDisplays ? NSScreen.screens : [NSScreen.screens.first].compactMap { $0 }
         spaceCoverManager.synchronize(config: config, screens: desiredScreens)
         let desiredIDs = Set(desiredScreens.compactMap(screenID))
 
-        for entry in entries where !desiredIDs.contains(entry.screenID) { entry.panel.orderOut(nil); entry.cornerPanels.forEach { $0.orderOut(nil) }; entry.menuBarCoverPanel.orderOut(nil) }
+        for entry in entries where !desiredIDs.contains(entry.screenID) { entry.panel.orderOut(nil); entry.cornerPanels.forEach { $0.orderOut(nil) } }
         entries.removeAll { !desiredIDs.contains($0.screenID) }
 
         for screen in desiredScreens {
@@ -76,7 +76,6 @@ final class BarPanelController {
                 entries.append(entry)
                 entry.panel.orderFrontRegardless()
                 updateCornerPanels(entry.cornerPanels, on: screen, config: config)
-                updateMenuBarCover(entry.menuBarCoverPanel, on: screen, config: config)
             }
         }
     }
@@ -103,8 +102,7 @@ final class BarPanelController {
         panel.ignoresMouseEvents = false
         panel.contentView = NSHostingView(rootView: StableBarRoot(model: model, context: context))
         let corners = [makeCornerPanel(isLeft: true), makeCornerPanel(isLeft: false)]
-        let menuBarCover = makeMenuBarCoverPanel(context: context)
-        return PanelEntry(screenID: id, panel: panel, context: context, cornerPanels: corners, menuBarCoverPanel: menuBarCover)
+        return PanelEntry(screenID: id, panel: panel, context: context, cornerPanels: corners)
     }
 
     private func update(_ entry: PanelEntry, on screen: NSScreen, config: BarConfiguration) {
@@ -120,70 +118,6 @@ final class BarPanelController {
         if !entry.panel.frame.equalTo(frame) { entry.panel.setFrame(frame, display: true, animate: false) }
         if !entry.panel.isVisible { entry.panel.orderFrontRegardless() }
         updateCornerPanels(entry.cornerPanels, on: screen, config: config)
-        updateMenuBarCover(entry.menuBarCoverPanel, on: screen, config: config)
-    }
-
-    private func makeMenuBarCoverPanel(context: PanelContext) -> NSPanel {
-        let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        // Native status items can share mainMenu + 1. Keep the wallpaper crop
-        // above every Apple menu-bar surface, while Ryft remains one level higher.
-        panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
-        // Stay fully opaque even while a large wallpaper is being decoded.
-        // Black is only a failure fallback; WallpaperCropView paints the exact
-        // per-Space crop over it as soon as the image is available.
-        panel.backgroundColor = .black; panel.isOpaque = true; panel.hasShadow = false; panel.hidesOnDeactivate = false; panel.ignoresMouseEvents = true
-        // Belong to the current Space rather than remaining stationary across
-        // every Space. During a swipe, each cover therefore travels with the
-        // wallpaper it was cropped from instead of bleeding into the next one.
-        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .ignoresCycle]
-        panel.contentView = NSHostingView(rootView: MenuBarCoverRoot(context: context))
-        return panel
-    }
-
-    private func updateMenuBarCover(_ panel: NSPanel, on screen: NSScreen, config: BarConfiguration) {
-        // Per-Space covers are owned by SpaceMenuBarCoverManager. Retain this
-        // legacy panel only to avoid rebuilding long-lived bar entries.
-        panel.orderOut(nil)
-    }
-
-    private func prepareCoversForSpaceChange() {
-        let generation = UUID()
-        spaceChangeGeneration = generation
-        coverWallpaperBeforeSpaceChange = Dictionary(uniqueKeysWithValues: entries.map { ($0.screenID, $0.context.wallpaperPath) })
-        coversWaitingForWallpaper = Set(entries.map { ObjectIdentifier($0.menuBarCoverPanel) })
-        // Never remove the cover between Spaces. Keeping it opaque prevents a
-        // one-frame flash of Apple's menu bar while wallpaper metadata catches up.
-        // orderFrontRegardless is intentional even when AppKit reports the
-        // panel as visible: a visible moveToActiveSpace panel may still belong
-        // to the outgoing Space until it is explicitly ordered on the new one.
-        entries.forEach { $0.menuBarCoverPanel.orderFrontRegardless() }
-        // Poll on the first transition frames instead of waiting for coarse
-        // retries. NSWorkspace usually exposes the destination wallpaper within
-        // one or two frames; later attempts cover slower Mission Control paths.
-        let delays = [0.0, 0.016, 0.033, 0.066, 0.12, 0.20, 0.32, 0.50]
-        for (attempt, delay) in delays.enumerated() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                self?.restoreCoversAfterSpaceChange(generation: generation, force: attempt == delays.count - 1)
-            }
-        }
-    }
-
-    private func restoreCoversAfterSpaceChange(generation: UUID, force: Bool) {
-        guard generation == spaceChangeGeneration else { return }
-        let config = model.configuration.bar
-        for entry in entries {
-            guard let screen = NSScreen.screens.first(where: { screenID($0) == entry.screenID }) else { continue }
-            let path = wallpaperPath(for: screen)
-            let previous = coverWallpaperBeforeSpaceChange[entry.screenID] ?? ""
-            guard force || path != previous else { continue }
-            if entry.context.wallpaperPath != path { entry.context.wallpaperPath = path }
-            coversWaitingForWallpaper.remove(ObjectIdentifier(entry.menuBarCoverPanel))
-            updateMenuBarCover(entry.menuBarCoverPanel, on: screen, config: config)
-        }
-        if coversWaitingForWallpaper.isEmpty || force {
-            if force { coversWaitingForWallpaper.removeAll() }
-            coverWallpaperBeforeSpaceChange.removeAll()
-        }
     }
 
     private func makeCornerPanel(isLeft: Bool) -> NSPanel {
@@ -206,14 +140,7 @@ final class BarPanelController {
     }
 
     private func panelFrame(on screen: NSScreen, config: BarConfiguration) -> NSRect {
-        let edgeInsets = config.presentation == .top ? 0 : config.outerInset * 2
-        let thickness = config.height + edgeInsets + (config.position == .top ? topReservedHeight(for: screen, config: config) : 0)
-        switch config.position {
-        case .top: return NSRect(x: screen.frame.minX, y: screen.frame.maxY - thickness, width: screen.frame.width, height: thickness)
-        case .bottom: return NSRect(x: screen.frame.minX, y: screen.frame.minY, width: screen.frame.width, height: thickness)
-        case .left: return NSRect(x: screen.frame.minX, y: screen.frame.minY, width: thickness, height: screen.frame.height)
-        case .right: return NSRect(x: screen.frame.maxX - thickness, y: screen.frame.minY, width: thickness, height: screen.frame.height)
-        }
+        DisplayLayoutMetrics.barFrame(for: screen, bar: config)
     }
 
     private func notchWidth(for screen: NSScreen, config: BarConfiguration) -> Double {
@@ -224,10 +151,7 @@ final class BarPanelController {
     }
 
     private func topReservedHeight(for screen: NSScreen, config: BarConfiguration) -> Double {
-        guard config.position == .top, config.notchMaskEnabled else { return 0 }
-        if config.notchMaskHeight > 0 { return config.notchMaskHeight }
-        guard screen.auxiliaryTopLeftArea != nil || screen.auxiliaryTopRightArea != nil else { return 0 }
-        return max(screen.safeAreaInsets.top, 32)
+        DisplayLayoutMetrics.notchShelfHeight(for: screen, bar: config)
     }
 
     private func wallpaperPath(for screen: NSScreen) -> String {
@@ -236,8 +160,7 @@ final class BarPanelController {
 
     private func refreshWallpaperPaths() {
         for entry in entries {
-            guard !coversWaitingForWallpaper.contains(ObjectIdentifier(entry.menuBarCoverPanel)),
-                  let screen = NSScreen.screens.first(where: { screenID($0) == entry.screenID }) else { continue }
+            guard let screen = NSScreen.screens.first(where: { screenID($0) == entry.screenID }) else { continue }
             let path = wallpaperPath(for: screen)
             if entry.context.wallpaperPath != path { entry.context.wallpaperPath = path }
         }
@@ -256,11 +179,6 @@ final class BarPanelController {
                 }.fill(Color(red: 0, green: 0, blue: 0)).scaleEffect(x: isLeft ? 1 : -1, y: 1)
             }
         }
-    }
-
-    private struct MenuBarCoverRoot: View {
-        @ObservedObject var context: PanelContext
-        var body: some View { WallpaperMenuBarCover(path: context.wallpaperPath, screenSize: context.screenSize) }
     }
 
     private struct StableBarRoot: View {
@@ -366,9 +284,12 @@ private final class SpaceMenuBarCoverManager {
                 let path = wallpaperPath(space: info.uuid, display: displayID)
                     ?? NSWorkspace.shared.desktopImageURL(for: screen)?.path
                     ?? ""
-                if let cover = covers[key] { update(cover, screen: screen, path: path) }
+                if let cover = covers[key] {
+                    update(cover, screen: screen, path: path, config: config)
+                    if !cover.panel.isVisible { cover.panel.orderFrontRegardless() }
+                }
                 else {
-                    let cover = makeCover(screen: screen, path: path)
+                    let cover = makeCover(screen: screen, path: path, config: config)
                     covers[key] = cover
                     cover.panel.orderFrontRegardless()
                     addWindows(connection, [NSNumber(value: cover.panel.windowNumber)] as CFArray, [NSNumber(value: id)] as CFArray)
@@ -379,9 +300,8 @@ private final class SpaceMenuBarCoverManager {
         for key in stale { covers[key]?.panel.orderOut(nil); covers.removeValue(forKey: key) }
     }
 
-    private func makeCover(screen: NSScreen, path: String) -> Cover {
-        let height = ceil(DisplayLayoutMetrics.menuBarHeight(for: screen)) + 1
-        let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - height, width: screen.frame.width, height: height)
+    private func makeCover(screen: NSScreen, path: String, config: BarConfiguration) -> Cover {
+        let frame = DisplayLayoutMetrics.menuBarCoverFrame(for: screen, bar: config)
         let panel = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
         panel.backgroundColor = .black; panel.isOpaque = true; panel.hasShadow = false
@@ -390,13 +310,12 @@ private final class SpaceMenuBarCoverManager {
         let view = WallpaperCropView(frame: NSRect(origin: .zero, size: frame.size))
         panel.contentView = view
         let cover = Cover(panel: panel, view: view)
-        update(cover, screen: screen, path: path)
+        update(cover, screen: screen, path: path, config: config)
         return cover
     }
 
-    private func update(_ cover: Cover, screen: NSScreen, path: String) {
-        let height = ceil(DisplayLayoutMetrics.menuBarHeight(for: screen)) + 1
-        let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - height, width: screen.frame.width, height: height)
+    private func update(_ cover: Cover, screen: NSScreen, path: String, config: BarConfiguration) {
+        let frame = DisplayLayoutMetrics.menuBarCoverFrame(for: screen, bar: config)
         if !cover.panel.frame.equalTo(frame) { cover.panel.setFrame(frame, display: true) }
         cover.view.screenSize = screen.frame.size
         if cover.view.path != path {

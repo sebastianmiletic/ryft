@@ -217,6 +217,10 @@ final class AppModel: ObservableObject {
         if !configuration.bar.widgets.contains(where: { $0.kind == .settings || $0.clickAction == .settings }) {
             configuration.bar.widgets.append(WidgetConfiguration(kind: .settings, name: "Ryft settings", placement: .trailing, icon: "gearshape.fill", showLabel: false, clickAction: .settings))
         }
+        if configuration.sourcePresetVersion < 18 {
+            configuration.tiling.mode = .dwindle
+            configuration.sourcePresetVersion = 18
+        }
         $configuration.dropFirst().debounce(for: .milliseconds(180), scheduler: RunLoop.main).sink { [weak self] value in
             self?.save(value)
         }.store(in: &cancellables)
